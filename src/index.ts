@@ -67,13 +67,6 @@ app.get("/v1/me", async (c) => {
   return c.json(session);
 });
 
-app.get("/debug/secret", (c) => {
-  return c.json({
-    hasTestSecret: Boolean(c.env.test_secret),
-    testSecretLength: c.env.test_secret?.length ?? 0,
-  });
-});
-
 app.notFound((c) => c.json({ error: "Not found" }, 404));
 
 export default app;
