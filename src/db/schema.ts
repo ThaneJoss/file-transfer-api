@@ -73,9 +73,70 @@ export const verification = sqliteTable(
   (table) => [index("verification_identifier_idx").on(table.identifier)],
 );
 
+export const passkey = sqliteTable(
+  "passkey",
+  {
+    id: text("id").primaryKey(),
+    name: text("name"),
+    publicKey: text("public_key").notNull(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    credentialID: text("credential_id").notNull(),
+    counter: integer("counter").notNull(),
+    deviceType: text("device_type").notNull(),
+    backedUp: integer("backed_up", { mode: "boolean" }).notNull(),
+    transports: text("transports"),
+    createdAt: integer("created_at", { mode: "timestamp" }),
+    aaguid: text("aaguid"),
+  },
+  (table) => [
+    index("passkey_user_id_idx").on(table.userId),
+    uniqueIndex("passkey_credential_id_unique").on(table.credentialID),
+  ],
+);
+
+export const passkeyRegistrationContext = sqliteTable(
+  "passkey_registration_context",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    name: text("name").notNull(),
+    email: text("email").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    usedAt: integer("used_at"),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("passkey_registration_context_user_id_unique").on(table.userId),
+    index("passkey_registration_context_expires_at_idx").on(table.expiresAt),
+  ],
+);
+
+export const usageEvent = sqliteTable(
+  "usage_event",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    service: text("service", { enum: ["turn", "r2", "sfu"] }).notNull(),
+    action: text("action").notNull(),
+    quantity: integer("quantity").notNull().default(1),
+    metadata: text("metadata", { mode: "json" }).$type<Record<string, unknown>>(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (table) => [
+    index("usage_event_user_created_at_idx").on(table.userId, table.createdAt),
+    index("usage_event_service_created_at_idx").on(table.service, table.createdAt),
+  ],
+);
+
 export const userRelations = relations(user, ({ many }) => ({
   sessions: many(session),
   accounts: many(account),
+  passkeys: many(passkey),
+  usageEvents: many(usageEvent),
 }));
 
 export const sessionRelations = relations(session, ({ one }) => ({
@@ -88,6 +149,20 @@ export const sessionRelations = relations(session, ({ one }) => ({
 export const accountRelations = relations(account, ({ one }) => ({
   user: one(user, {
     fields: [account.userId],
+    references: [user.id],
+  }),
+}));
+
+export const passkeyRelations = relations(passkey, ({ one }) => ({
+  user: one(user, {
+    fields: [passkey.userId],
+    references: [user.id],
+  }),
+}));
+
+export const usageEventRelations = relations(usageEvent, ({ one }) => ({
+  user: one(user, {
+    fields: [usageEvent.userId],
     references: [user.id],
   }),
 }));
