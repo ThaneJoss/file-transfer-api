@@ -1,0 +1,29 @@
+{
+  "name": "file-transfer-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "cf-typegen": "wrangler types",
+    "db:generate": "drizzle-kit generate",
+    "db:migrations:list:local": "wrangler d1 migrations list file-transfer-api-db --local",
+    "db:migrations:list:remote": "wrangler d1 migrations list file-transfer-api-db --remote",
+    "db:migrations:apply:local": "wrangler d1 migrations apply file-transfer-api-db --local",
+    "db:migrations:apply:remote": "wrangler d1 migrations apply file-transfer-api-db --remote"
+  },
+  "dependencies": {
+    "@better-auth/drizzle-adapter": "^1.6.19",
+    "better-auth": "^1.6.19",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.12.26"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260619.1",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.103.0"
+  }
+}

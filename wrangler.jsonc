@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "file-transfer-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "api.file.thanejoss.com",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "BETTER_AUTH_URL": "https://api.file.thanejoss.com",
+    "APP_ORIGIN": "https://file.thanejoss.com"
+  },
+  "secrets": {
+    "required": ["BETTER_AUTH_SECRET", "test_secret"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "file-transfer-api-db",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
