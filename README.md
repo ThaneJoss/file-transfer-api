@@ -1,50 +1,96 @@
 # file-transfer-api
 
-Cloudflare Worker API for `api.file.thanejoss.com`, built with Hono, Better Auth, Cloudflare D1, and Worker Secrets.
+File Transfer 的 Cloudflare Worker API。
 
-## Local setup
+```txt
+生产 API:     https://api.file.thanejoss.com
+GitHub 仓库:  https://github.com/ThaneJoss/file-transfer-api
+Worker:      file-transfer-api
+D1:          file-transfer-api-db
+```
+
+## 技术栈
+
+Hono + Better Auth + Cloudflare D1 + Worker Secrets。
+
+## Cloudflare 部署
+
+通过 Cloudflare Workers Builds 连接 GitHub 自动部署。
+
+```txt
+Repository: ThaneJoss/file-transfer-api
+Production branch: main
+Root directory: /
+Build command: 留空
+Deploy command: pnpm run deploy
+Non-production branch deploy command: pnpm wrangler versions upload
+```
+
+Build Variables:
+
+```txt
+PNPM_VERSION=11.6.0
+```
+
+`main` 已配置 GitHub ruleset，只能通过 PR 更新。
+
+## 密钥
+
+密钥值只放在 Cloudflare Worker 的 Runtime Secrets，不写入 GitHub。`wrangler.jsonc` 只声明必需密钥名。
+
+```sh
+openssl rand -base64 32 | pnpm wrangler secret put BETTER_AUTH_SECRET --name file-transfer-api
+printf '<diagnostic-value>' | pnpm wrangler secret put test_secret --name file-transfer-api
+pnpm wrangler secret list --name file-transfer-api
+```
+
+`test_secret` 仅用于临时部署验证，确认后应从代码和配置中移除。
+
+## D1
+
+生产 D1 binding 为 `DB`，数据库 ID 已写在 `wrangler.jsonc`。
+
+```sh
+pnpm db:migrations:apply:remote
+pnpm db:migrations:list:remote
+```
+
+本地开发：
 
 ```sh
 pnpm install
-cp .dev.vars.example .dev.vars
-openssl rand -base64 32
 pnpm db:migrations:apply:local
 pnpm dev
 ```
 
-Put the generated secret in `.dev.vars` as `BETTER_AUTH_SECRET`.
-
-For local secret-read checks, you can also add:
+本地 `.dev.vars`：
 
 ```sh
-test_secret=123456
+BETTER_AUTH_SECRET=<local-random-secret>
+test_secret=<local-diagnostic-value>
 ```
 
-## Cloudflare setup
+## 验证
 
 ```sh
-pnpm wrangler d1 create file-transfer-api-db
+curl https://api.file.thanejoss.com/health
+curl https://api.file.thanejoss.com/debug/secret
 ```
 
-Copy the returned `database_id` into `wrangler.jsonc`, then set the production secrets and apply migrations:
+期望：
 
-```sh
-openssl rand -base64 32 | pnpm wrangler secret put BETTER_AUTH_SECRET
-printf '123456' | pnpm wrangler secret put test_secret
-pnpm db:migrations:apply:remote
-pnpm deploy
+```json
+{"ok":true,"db":"ok"}
 ```
 
-The Worker route is configured as a Custom Domain:
-
-```txt
-https://api.file.thanejoss.com
+```json
+{"hasTestSecret":true,"testSecretLength":6}
 ```
 
 ## API
 
-- `GET /` service metadata
-- `GET /health` D1 smoke check
-- `GET|POST /api/auth/*` Better Auth handler
-- `GET /v1/me` current Better Auth session
-- `GET /debug/secret` secret-read smoke check without returning the secret value
+- `GET /`
+- `GET /health`
+- `GET|POST /api/auth/*`
+- `GET /v1/me`
+- `GET /debug/secret`
