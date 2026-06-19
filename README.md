@@ -34,17 +34,16 @@ PNPM_VERSION=11.6.0
 
 `main` 已配置 GitHub ruleset，只能通过 PR 更新。
 
-## 密钥
+## 运行时密钥
 
-密钥值只放在 Cloudflare Worker 的 Runtime Secrets，不写入 GitHub。`wrangler.jsonc` 只声明必需密钥名。
+只需要一个生产密钥：
 
 ```sh
 openssl rand -base64 32 | pnpm wrangler secret put BETTER_AUTH_SECRET --name file-transfer-api
-printf '<diagnostic-value>' | pnpm wrangler secret put test_secret --name file-transfer-api
 pnpm wrangler secret list --name file-transfer-api
 ```
 
-`test_secret` 仅用于临时部署验证，确认后应从代码和配置中移除。
+密钥值只放在 Cloudflare Worker Runtime Secrets，不写入 GitHub。
 
 ## D1
 
@@ -67,14 +66,12 @@ pnpm dev
 
 ```sh
 BETTER_AUTH_SECRET=<local-random-secret>
-test_secret=<local-diagnostic-value>
 ```
 
 ## 验证
 
 ```sh
 curl https://api.file.thanejoss.com/health
-curl https://api.file.thanejoss.com/debug/secret
 ```
 
 期望：
@@ -83,14 +80,9 @@ curl https://api.file.thanejoss.com/debug/secret
 {"ok":true,"db":"ok"}
 ```
 
-```json
-{"hasTestSecret":true,"testSecretLength":6}
-```
-
 ## API
 
 - `GET /`
 - `GET /health`
 - `GET|POST /api/auth/*`
 - `GET /v1/me`
-- `GET /debug/secret`

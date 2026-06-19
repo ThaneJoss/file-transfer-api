@@ -22,8 +22,7 @@
 	},
 	"secrets": {
 		"required": [
-			"BETTER_AUTH_SECRET",
-			"test_secret"
+			"BETTER_AUTH_SECRET"
 		]
 	},
 	"d1_databases": [

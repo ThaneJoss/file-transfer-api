@@ -3,5 +3,4 @@ export type Bindings = {
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;
   APP_ORIGIN?: string;
-  test_secret: string;
 };
