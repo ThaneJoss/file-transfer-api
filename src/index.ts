@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { createAuth } from "./auth";
+import { createRegistrationContext, normalizeRegistrationName } from "./passkey-registration";
 import { issueR2Credentials } from "./services/r2";
 import { matchSfuRoute, proxySfuRequest } from "./services/sfu";
 import { issueTurnCredentials } from "./services/turn";
@@ -107,6 +108,26 @@ app.use("/v1/*", async (c, next) => {
     return c.json({ error: "Origin not allowed" }, 403);
   }
   await next();
+});
+
+app.post("/v1/passkey/registration-context", async (c) => {
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) {
+    return parsed.error;
+  }
+  if (Object.keys(parsed.value).length !== 1) {
+    return c.json({ error: "Request body must contain only name" }, 400);
+  }
+  const name = normalizeRegistrationName(parsed.value.name);
+  if (!name) {
+    return c.json({ error: "name must be a non-empty string up to 80 characters" }, 400);
+  }
+  const context = await createRegistrationContext(
+    c.env.DB,
+    c.env.BETTER_AUTH_SECRET,
+    name,
+  );
+  return c.json({ context }, 201);
 });
 
 app.use("/v1/*", requireSession);

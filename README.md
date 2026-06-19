@@ -11,7 +11,8 @@ D1:          file-transfer-api-db
 
 ## 技术栈
 
-Hono + Better Auth + Cloudflare D1 + Worker Secrets。
+Hono + Better Auth 1.6.19 + `@better-auth/passkey` 1.6.19 + Cloudflare D1 +
+Worker Secrets。鉴权只启用 Passkey，不提供 email/password 注册或登录。
 
 ## Cloudflare 部署
 
@@ -38,7 +39,7 @@ PNPM_VERSION=11.6.0
 
 Worker 只负责：
 
-1. Better Auth 注册、登录和 session 校验。
+1. Better Auth Passkey 注册、登录和 session 校验。
 2. 托管 TURN、R2、SFU 长期密钥，向已登录用户提供短期或受限访问。
 3. 将成功的凭证签发和 SFU 控制面调用写入 `usage_event`。
 
@@ -76,6 +77,13 @@ pnpm db:migrations:apply:remote
 pnpm db:migrations:list:remote
 ```
 
+Passkey 使用的 migration 是 `migrations/0003_passkey_auth.sql`，其中包含 Better
+Auth 的 `passkey` 表和一次性注册上下文表。部署新代码前先执行：
+
+```sh
+pnpm db:migrations:apply:remote
+```
+
 本地开发：
 
 ```sh
@@ -88,7 +96,64 @@ pnpm dev
 
 ```sh
 BETTER_AUTH_SECRET=<local-random-secret>
+BETTER_AUTH_URL=http://localhost:8787
+APP_ORIGIN=http://localhost:5173
 ```
+
+本地完整调用 TURN、R2、SFU API 时，还需要按 `.dev.vars.example` 配置相应的
+Cloudflare 凭证。纯 Passkey 注册和登录只需要上面的三个变量与本地 D1 migration。
+
+## Passkey 与 WebAuthn
+
+WebAuthn RP 必须是前端站点，不能是 API 域名：
+
+| 环境 | `APP_ORIGIN` / WebAuthn origin | RP ID |
+| --- | --- | --- |
+| 生产 | `https://file.thanejoss.com` | `file.thanejoss.com` |
+| 本地 | `http://localhost:5173` | `localhost` |
+
+Worker 从 `APP_ORIGIN` 的 hostname 得到 RP ID。生产 API 仍为
+`https://api.file.thanejoss.com`，Better Auth 路径仍为 `/api/auth/*`。
+
+首次注册先获取服务端注册上下文：
+
+```http
+POST /v1/passkey/registration-context
+Content-Type: application/json
+
+{"name":"用户名称"}
+```
+
+成功响应为 `201`：
+
+```json
+{"context":"短期、签名且一次性使用的注册上下文"}
+```
+
+请求体只能包含 `name`，长度为 1 到 80 个字符。context 有效期 5 分钟，成功
+注册后立即失效。用户 ID 和 Better Auth 必需的内部占位 email 均由服务端生成；
+前端不能提交 email 或用户 ID。WebAuthn display name 和 `/v1/me` 中的主要显示字段
+均为用户提交的 `name`，不是内部 email。
+
+前端 Better Auth client 需要配置 `passkeyClient()`，调用契约为：
+
+```ts
+const { context } = await fetch(
+  "https://api.file.thanejoss.com/v1/passkey/registration-context",
+  {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  },
+).then((response) => response.json());
+
+await authClient.passkey.addPasskey({ name, context });
+await authClient.signIn.passkey();
+```
+
+注册和登录成功后，服务端都会自动设置 Better Auth session cookie；之后跨域访问
+`/v1/*` 仍需使用 `credentials: "include"`。
 
 ## 验证
 
@@ -107,6 +172,7 @@ curl https://api.file.thanejoss.com/health
 - `GET /`
 - `GET /health`
 - `GET|POST /api/auth/*`
+- `POST /v1/passkey/registration-context`，公开，仅签发短期一次性注册上下文
 - `GET /v1/me`，需要 Better Auth session
 - `GET /v1/usage`，返回当前用户的事件汇总
 - `POST /v1/turn/credentials`
