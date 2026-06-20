@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Bindings } from "../types";
 
-export type PickupVariant = "direct" | "stun";
+export type PickupVariant = "direct" | "stun" | "turn" | "sfu" | "r2";
 
 type PickupRecord = {
   sender_user_id: string;

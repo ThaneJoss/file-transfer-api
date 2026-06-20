@@ -41,7 +41,7 @@ Worker 只负责：
 
 1. Better Auth Passkey 注册、登录和 session 校验。
 2. 托管 TURN、R2、SFU 长期密钥，向已登录用户提供短期或受限访问。
-3. 使用 Durable Object 保存 Direct/STUN 的短期 Offer/Answer 信令，不保存文件内容。
+3. 使用 Durable Object 保存 Direct/STUN/TURN/SFU/R2 的短期取件码信令，不保存文件内容。
 4. 将流量字节和 Durable 请求次数写入 `usage_event`，并提供用户额度与管理统计。
 
 TURN 返回短期 `iceServers`。R2 返回仅限一个服务端生成对象 key 的临时 S3

@@ -74,6 +74,33 @@ describe("pickup code API", () => {
     expect(receiverSummary.summary.find((item) => item.service === "durable")?.usage).toBe(2);
   });
 
+  it("accepts every transfer method as a pickup variant", async () => {
+    const sender = await registerUser("Pickup Variant Sender");
+    const receiver = await registerUser("Pickup Variant Receiver");
+
+    for (const variant of ["turn", "sfu", "r2"] as const) {
+      const createResponse = await request(
+        "/v1/pickups",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ variant, offer: `${variant}-offer` }),
+        },
+        sender.jar,
+      );
+      expect(createResponse.status).toBe(201);
+      const pickup = await createResponse.json<{ code: string }>();
+
+      const offerResponse = await request(`/v1/pickups/${pickup.code}`, {}, receiver.jar);
+      expect(offerResponse.status).toBe(200);
+      expect(await offerResponse.json()).toMatchObject({
+        status: "found",
+        variant,
+        offer: `${variant}-offer`,
+      });
+    }
+  });
+
   it("records completed Direct/STUN bytes idempotently", async () => {
     const user = await registerUser("Transfer Usage");
     const body = JSON.stringify({
