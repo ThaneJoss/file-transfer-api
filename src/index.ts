@@ -31,6 +31,13 @@ function integerInRange(value: unknown, fallback: number, min: number, max: numb
     : null;
 }
 
+function optionalByteCount(value: unknown) {
+  if (value === undefined) {
+    return undefined;
+  }
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 async function readJsonObject(c: Context<AppEnv>) {
   if (!c.req.header("content-type")?.toLowerCase().startsWith("application/json")) {
     return { error: c.json({ error: "Content-Type must be application/json" }, 415) };
@@ -142,9 +149,9 @@ app.get("/v1/me", async (c) => {
 
 app.get("/v1/usage", async (c) => {
   const { userId } = c.get("auth");
-  const summary = await getUsageSummary(c.env, userId);
+  const usage = await getUsageSummary(c.env, userId);
 
-  return c.json({ summary });
+  return c.json(usage);
 });
 
 app.post("/v1/turn/credentials", async (c) => {
@@ -160,13 +167,6 @@ app.post("/v1/turn/credentials", async (c) => {
 
   try {
     const credentials = await issueTurnCredentials(c.env, ttlSeconds);
-    const { userId } = c.get("auth");
-    await recordUsage(c.env, {
-      userId,
-      service: "turn",
-      action: "credential.issued",
-      metadata: { ttlSeconds },
-    });
     return c.json(credentials, 201);
   } catch (error) {
     logUpstreamError("turn", error);
@@ -188,6 +188,10 @@ app.post("/v1/r2/credentials", async (c) => {
   if (ttlSeconds === null) {
     return c.json({ error: "ttlSeconds must be an integer from 60 to 3600" }, 400);
   }
+  const fileSizeBytes = optionalByteCount(parsed.value.fileSizeBytes);
+  if (fileSizeBytes === null) {
+    return c.json({ error: "fileSizeBytes must be a non-negative safe integer" }, 400);
+  }
 
   try {
     const { userId } = c.get("auth");
@@ -196,12 +200,20 @@ app.post("/v1/r2/credentials", async (c) => {
       fileName,
       ttlSeconds,
     });
-    await recordUsage(c.env, {
-      userId,
-      service: "r2",
-      action: "credential.issued",
-      metadata: { ttlSeconds },
-    });
+    if (fileSizeBytes !== undefined) {
+      await recordUsage(c.env, {
+        userId,
+        service: "r2",
+        bytes: fileSizeBytes,
+        action: "r2.upload.bytes",
+        metadata: {
+          fileName,
+          objectKey: credentials.objectKey,
+          ttlSeconds,
+          source: "declared_file_size",
+        },
+      });
+    }
     return c.json(credentials, 201);
   } catch (error) {
     logUpstreamError("r2", error);
@@ -231,15 +243,6 @@ app.all("/v1/sfu/*", async (c) => {
 
   try {
     const response = await proxySfuRequest(c.env, path, route.method, body);
-    if (response.ok) {
-      const { userId } = c.get("auth");
-      await recordUsage(c.env, {
-        userId,
-        service: "sfu",
-        action: route.action,
-        metadata: { status: response.status },
-      });
-    }
 
     return new Response(response.body, {
       status: response.status,
