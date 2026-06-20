@@ -110,8 +110,21 @@ describe("usage API", () => {
     expect(body.period.timezone).toBe("UTC");
     expect(Date.parse(body.period.end)).toBeGreaterThanOrEqual(beforeRequest.getTime());
     expect(Date.parse(body.period.end)).toBeLessThanOrEqual(afterRequest.getTime());
-    expect(body.summary.map((item) => item.service)).toEqual(["turn", "sfu", "r2"]);
+    expect(body.summary.map((item) => item.service)).toEqual([
+      "direct",
+      "stun",
+      "turn",
+      "sfu",
+      "r2",
+      "durable",
+    ]);
     expect(body.summary.every((item) => item.bytes === 0 && item.quotaBytes === null)).toBe(true);
+    expect(body.summary.find((item) => item.service === "durable")).toMatchObject({
+      unit: "requests",
+      usage: 0,
+      quota: null,
+    });
+    expect(body.totals).toEqual({ bytes: 0, requests: 0 });
     expect(body.totalBytes).toBe(0);
     expect(body.totalQuotaBytes).toBeNull();
   });
@@ -126,31 +139,31 @@ describe("usage API", () => {
     await recordUsage(bindings, {
       userId: owner.userId,
       service: "turn",
-      bytes: 100,
+      quantity: 100,
       createdAt: period.start,
     });
     await recordUsage(bindings, {
       userId: owner.userId,
       service: "sfu",
-      bytes: 200,
+      quantity: 200,
       createdAt: insideMonth,
     });
     await recordUsage(bindings, {
       userId: owner.userId,
       service: "r2",
-      bytes: 300,
+      quantity: 300,
       createdAt: insideMonth,
     });
     await recordUsage(bindings, {
       userId: owner.userId,
       service: "r2",
-      bytes: 999,
+      quantity: 999,
       createdAt: beforeMonthStart,
     });
     await recordUsage(bindings, {
       userId: other.userId,
       service: "turn",
-      bytes: 500,
+      quantity: 500,
       createdAt: insideMonth,
     });
 

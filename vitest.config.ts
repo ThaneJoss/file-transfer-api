@@ -13,10 +13,14 @@ export default defineConfig({
   },
   plugins: [
     cloudflareTest(async () => ({
+      main: "./src/index.ts",
       miniflare: {
         compatibilityDate: "2026-06-19",
         compatibilityFlags: ["nodejs_compat"],
         d1Databases: ["DB"],
+        durableObjects: {
+          PICKUP_SESSIONS: { className: "PickupSession", useSQLite: true },
+        },
         bindings: {
           TEST_MIGRATIONS: await readD1Migrations("./migrations"),
           BETTER_AUTH_SECRET: "test-secret-with-at-least-thirty-two-characters",

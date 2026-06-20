@@ -1,15 +1,25 @@
-import { drizzle } from "drizzle-orm/d1";
-import { usageEvent } from "./db/schema";
 import type { Bindings } from "./types";
 
-export type UsageService = "turn" | "r2" | "sfu";
+export const usageServices = ["direct", "stun", "turn", "sfu", "r2", "durable"] as const;
+export type UsageService = (typeof usageServices)[number];
+export type UsageUnit = "bytes" | "requests";
 
-const usageServices: UsageService[] = ["turn", "sfu", "r2"];
+export const serviceUnits: Record<UsageService, UsageUnit> = {
+  direct: "bytes",
+  stun: "bytes",
+  turn: "bytes",
+  sfu: "bytes",
+  r2: "bytes",
+  durable: "requests",
+};
 
-const defaultByteActions: Record<UsageService, string> = {
+const defaultActions: Record<UsageService, string> = {
+  direct: "direct.transfer.bytes",
+  stun: "stun.transfer.bytes",
   turn: "turn.relay.bytes",
   sfu: "sfu.forwarded.bytes",
   r2: "r2.upload.bytes",
+  durable: "durable.request",
 };
 
 type UsagePeriod = {
@@ -18,8 +28,11 @@ type UsagePeriod = {
   timezone: "UTC";
 };
 
-type UsageSummaryItem = {
+export type UsageSummaryItem = {
   service: UsageService;
+  unit: UsageUnit;
+  usage: number;
+  quota: number | null;
   bytes: number;
   quotaBytes: number | null;
 };
@@ -27,18 +40,24 @@ type UsageSummaryItem = {
 export type UsageSummaryResponse = {
   period: UsagePeriod;
   summary: UsageSummaryItem[];
+  totals: Record<UsageUnit, number>;
+  quotas: Record<UsageUnit, number | null>;
   totalBytes: number;
   totalQuotaBytes: number | null;
 };
 
-function assertByteCount(bytes: number) {
-  if (!Number.isSafeInteger(bytes) || bytes < 0) {
-    throw new RangeError("bytes must be a non-negative safe integer");
+function assertQuantity(quantity: number) {
+  if (!Number.isSafeInteger(quantity) || quantity < 0) {
+    throw new RangeError("quantity must be a non-negative safe integer");
   }
 }
 
 function toEpochSeconds(date: Date) {
   return Math.floor(date.getTime() / 1000);
+}
+
+export function isUsageService(value: unknown): value is UsageService {
+  return typeof value === "string" && usageServices.includes(value as UsageService);
 }
 
 export function getCurrentMonthlyUsagePeriod(now = new Date()) {
@@ -56,25 +75,35 @@ export async function recordUsage(
   event: {
     userId: string;
     service: UsageService;
-    bytes: number;
+    quantity: number;
     action?: string;
     metadata?: Record<string, unknown>;
+    idempotencyKey?: string;
     createdAt?: Date;
   },
 ) {
-  assertByteCount(event.bytes);
+  assertQuantity(event.quantity);
+  const unit = serviceUnits[event.service];
+  const result = await env.DB.prepare(
+    `INSERT INTO usage_event
+       (id, user_id, service, action, quantity, unit, idempotency_key, metadata, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT DO NOTHING`,
+  )
+    .bind(
+      crypto.randomUUID(),
+      event.userId,
+      event.service,
+      event.action ?? defaultActions[event.service],
+      event.quantity,
+      unit,
+      event.idempotencyKey ?? null,
+      JSON.stringify({ ...event.metadata, unit }),
+      toEpochSeconds(event.createdAt ?? new Date()),
+    )
+    .run();
 
-  const db = drizzle(env.DB);
-
-  await db.insert(usageEvent).values({
-    id: crypto.randomUUID(),
-    userId: event.userId,
-    service: event.service,
-    action: event.action ?? defaultByteActions[event.service],
-    bytes: event.bytes,
-    metadata: { ...event.metadata, unit: "bytes" },
-    createdAt: event.createdAt ?? new Date(),
-  });
+  return result.meta.changes > 0;
 }
 
 export async function getUsageSummary(
@@ -85,34 +114,45 @@ export async function getUsageSummary(
   const period = getCurrentMonthlyUsagePeriod(now);
   const startSeconds = toEpochSeconds(period.start);
   const endSeconds = toEpochSeconds(period.end);
-  const result = await env.DB.prepare(
-    `SELECT service, SUM(CASE WHEN bytes > 0 THEN bytes ELSE 0 END) AS bytes
-     FROM usage_event
-     WHERE user_id = ?
-       AND created_at >= ?
-       AND created_at <= ?
-       AND service IN ('turn', 'sfu', 'r2')
-     GROUP BY service`,
-  )
-    .bind(userId, startSeconds, endSeconds)
-    .all<{
-      service: UsageService;
-      bytes: number | null;
-    }>();
+  const [usageResult, quotaResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT service, unit, SUM(CASE WHEN quantity > 0 THEN quantity ELSE 0 END) AS usage
+       FROM usage_event
+       WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+       GROUP BY service, unit`,
+    )
+      .bind(userId, startSeconds, endSeconds)
+      .all<{ service: string; unit: string; usage: number | null }>(),
+    env.DB.prepare(
+      `SELECT service, unit, limit_value AS quota
+       FROM user_quota
+       WHERE user_id = ?`,
+    )
+      .bind(userId)
+      .all<{ service: string; unit: string; quota: number }>(),
+  ]);
 
-  const bytesByService = new Map<UsageService, number>();
-  for (const row of result.results) {
-    if (usageServices.includes(row.service)) {
-      bytesByService.set(row.service, row.bytes ?? 0);
-    }
+  const usageByKey = new Map(usageResult.results.map((row) => [`${row.service}:${row.unit}`, row.usage ?? 0]));
+  const quotaByKey = new Map(quotaResult.results.map((row) => [`${row.service}:${row.unit}`, row.quota]));
+  const summary = usageServices.map((service): UsageSummaryItem => {
+    const unit = serviceUnits[service];
+    const usage = usageByKey.get(`${service}:${unit}`) ?? 0;
+    const quota = quotaByKey.get(`${service}:${unit}`) ?? null;
+    return {
+      service,
+      unit,
+      usage,
+      quota,
+      bytes: unit === "bytes" ? usage : 0,
+      quotaBytes: unit === "bytes" ? quota : null,
+    };
+  });
+  const totals = { bytes: 0, requests: 0 } satisfies Record<UsageUnit, number>;
+  const quotaTotals: Record<UsageUnit, number | null> = { bytes: null, requests: null };
+  for (const item of summary) {
+    totals[item.unit] += item.usage;
+    if (item.quota !== null) quotaTotals[item.unit] = (quotaTotals[item.unit] ?? 0) + item.quota;
   }
-
-  const summary = usageServices.map((service) => ({
-    service,
-    bytes: bytesByService.get(service) ?? 0,
-    quotaBytes: null,
-  }));
-  const totalBytes = summary.reduce((total, item) => total + item.bytes, 0);
 
   return {
     period: {
@@ -121,7 +161,9 @@ export async function getUsageSummary(
       timezone: period.timezone,
     },
     summary,
-    totalBytes,
-    totalQuotaBytes: null,
+    totals,
+    quotas: quotaTotals,
+    totalBytes: totals.bytes,
+    totalQuotaBytes: quotaTotals.bytes,
   };
 }

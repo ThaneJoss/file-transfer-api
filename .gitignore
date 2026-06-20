@@ -8,5 +8,3 @@ coverage/
 .env.*
 !.env.example
 !.dev.vars.example
-
-worker-configuration.d.ts

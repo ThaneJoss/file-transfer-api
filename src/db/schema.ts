@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm";
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const user = sqliteTable(
   "user",
@@ -120,15 +120,35 @@ export const usageEvent = sqliteTable(
     userId: text("user_id")
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
-    service: text("service", { enum: ["turn", "r2", "sfu"] }).notNull(),
+    service: text("service", { enum: ["direct", "stun", "turn", "r2", "sfu", "durable"] }).notNull(),
     action: text("action").notNull(),
-    bytes: integer("bytes").notNull().default(0),
+    quantity: integer("quantity").notNull().default(0),
+    unit: text("unit", { enum: ["bytes", "requests"] }).notNull().default("bytes"),
+    idempotencyKey: text("idempotency_key"),
     metadata: text("metadata", { mode: "json" }).$type<Record<string, unknown>>(),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   },
   (table) => [
     index("usage_event_user_created_at_idx").on(table.userId, table.createdAt),
     index("usage_event_service_created_at_idx").on(table.service, table.createdAt),
+    uniqueIndex("usage_event_idempotency_key_unique").on(table.idempotencyKey),
+  ],
+);
+
+export const userQuota = sqliteTable(
+  "user_quota",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    service: text("service", { enum: ["direct", "stun", "turn", "r2", "sfu", "durable"] }).notNull(),
+    unit: text("unit", { enum: ["bytes", "requests"] }).notNull(),
+    limitValue: integer("limit_value").notNull(),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.service, table.unit] }),
+    index("user_quota_service_unit_idx").on(table.service, table.unit),
   ],
 );
 
@@ -137,6 +157,7 @@ export const userRelations = relations(user, ({ many }) => ({
   accounts: many(account),
   passkeys: many(passkey),
   usageEvents: many(usageEvent),
+  quotas: many(userQuota),
 }));
 
 export const sessionRelations = relations(session, ({ one }) => ({
@@ -163,6 +184,13 @@ export const passkeyRelations = relations(passkey, ({ one }) => ({
 export const usageEventRelations = relations(usageEvent, ({ one }) => ({
   user: one(user, {
     fields: [usageEvent.userId],
+    references: [user.id],
+  }),
+}));
+
+export const userQuotaRelations = relations(userQuota, ({ one }) => ({
+  user: one(user, {
+    fields: [userQuota.userId],
     references: [user.id],
   }),
 }));
