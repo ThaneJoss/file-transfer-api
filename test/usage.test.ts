@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Bindings } from "../src/types";
 import {
   getCurrentMonthlyUsagePeriod,
@@ -86,6 +86,10 @@ function byService(response: UsageSummaryResponse) {
 }
 
 describe("usage API", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("returns 401 when the user is not authenticated", async () => {
     const response = await request("/v1/usage");
 
@@ -162,5 +166,56 @@ describe("usage API", () => {
     expect(body.totalBytes).toBe(600);
     expect(body.period.start).toBe(period.start.toISOString());
     expect(body.period.timezone).toBe("UTC");
+  });
+
+  it("records declared TURN bytes when credentials are issued", async () => {
+    const owner = await registerUser("TURN Usage Owner");
+    const turnFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe(
+        "https://rtc.live.cloudflare.com/v1/turn/keys/test/credentials/generate-ice-servers",
+      );
+      expect(init?.method).toBe("POST");
+      expect(init?.headers).toEqual({
+        Authorization: "Bearer test",
+        "Content-Type": "application/json",
+      });
+      expect(init?.body).toBe(JSON.stringify({ ttl: 3600 }));
+
+      return new Response(
+        JSON.stringify({
+          iceServers: [
+            {
+              urls: "turn:example.com:3478?transport=udp",
+              username: "temporary-user",
+              credential: "temporary-password",
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    const credentialsResponse = await request(
+      "/v1/turn/credentials",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ttlSeconds: 3600, fileSizeBytes: 1234 }),
+      },
+      owner.jar,
+    );
+
+    expect(credentialsResponse.status).toBe(201);
+    expect(turnFetch).toHaveBeenCalledTimes(1);
+
+    const usageResponse = await request("/v1/usage", {}, owner.jar);
+    expect(usageResponse.status).toBe(200);
+    const body = await usageResponse.json<UsageSummaryResponse>();
+    const summary = byService(body);
+
+    expect(summary.get("turn")?.bytes).toBe(1234);
+    expect(summary.get("sfu")?.bytes).toBe(0);
+    expect(summary.get("r2")?.bytes).toBe(0);
+    expect(body.totalBytes).toBe(1234);
   });
 });

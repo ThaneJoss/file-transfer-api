@@ -47,11 +47,11 @@ TURN 返回短期 `iceServers`。R2 返回仅限一个服务端生成对象 key 
 凭证。Cloudflare Realtime SFU 没有可下发给浏览器的短期 App Token，因此
 Worker 只代理文件传输需要的控制面接口，长期 App Token 不离开 Worker。
 
-文件数据不经过 Worker。`usage_event.bytes` 只记录后端能确认的流量字节；
-`credential.issued`、`session.create` 等控制面次数不作为额度依据。R2 凭证接口
-可接收 `fileSizeBytes` 记录上传文件大小。TURN relay 和 SFU data channel 的精确
-per-user bytes 需要 Cloudflare 侧可归属的流量回传或后续专门埋点；在没有可信来源前，
-API 不用发证/会话次数冒充流量。
+文件数据不经过 Worker。`usage_event.bytes` 只记录发证请求中声明的文件大小；
+`credential.issued`、`session.create` 等控制面次数不作为额度依据。TURN 与 R2
+凭证接口可接收 `fileSizeBytes`，在短期凭证签发成功后立即写入对应服务用量，
+不等待实际传输完成。SFU data channel 的精确 per-user bytes 需要 Cloudflare
+侧可归属的流量回传或后续专门埋点；在没有可信来源前，API 不用会话次数冒充流量。
 
 ## 运行时密钥
 
@@ -189,7 +189,7 @@ await fetch("https://api.file.thanejoss.com/v1/turn/credentials", {
   method: "POST",
   credentials: "include",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ ttlSeconds: 3600 }),
+  body: JSON.stringify({ ttlSeconds: 3600, fileSizeBytes: file.size }),
 });
 ```
 
@@ -217,7 +217,7 @@ await fetch("https://api.file.thanejoss.com/v1/turn/credentials", {
 TURN 请求体：
 
 ```json
-{"ttlSeconds":3600}
+{"ttlSeconds":3600,"fileSizeBytes":123456}
 ```
 
 R2 请求体：
@@ -228,8 +228,8 @@ R2 请求体：
 
 R2 响应包含 `accountId`、`bucket`、`endpoint`、服务端生成的 `objectKey`，
 以及 `accessKeyId`、`secretAccessKey`、`sessionToken`、`expiresAt`。前端的
-S3 签名实现必须同时发送 `sessionToken`。`fileSizeBytes` 可省略；省略时后端
-无法确认本次上传大小，因此不会写入 R2 bytes 用量。
+S3 签名实现必须同时发送 `sessionToken`。TURN 与 R2 的 `fileSizeBytes` 可省略；
+省略时后端无法确认本次文件大小，因此不会写入该服务 bytes 用量。
 
 SFU 代理路径与 Cloudflare Realtime 的应用内路径一致，例如：
 
