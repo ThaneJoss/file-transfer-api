@@ -23,6 +23,9 @@ importers:
       hono:
         specifier: ^4.12.26
         version: 4.12.26
+      jose:
+        specifier: ^6.2.3
+        version: 6.2.3
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: ^0.16.17

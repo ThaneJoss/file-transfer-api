@@ -1,15 +1,9 @@
+import { SignJWT } from "jose";
+
 import type { Bindings } from "../types";
 
-type R2TemporaryCredentialResponse = {
-  success?: boolean;
-  errors?: Array<{ code?: number; message?: string }>;
-  messages?: Array<{ code?: number; message?: string }>;
-  result?: {
-    accessKeyId?: string;
-    secretAccessKey?: string;
-    sessionToken?: string;
-  };
-};
+const encoder = new TextEncoder();
+const sha256HexPattern = /^[a-f0-9]{64}$/iu;
 
 function safePathSegment(value: string, fallback: string) {
   const sanitized = value
@@ -29,26 +23,22 @@ function buildObjectKey(userId: string, fileName: string) {
   return `users/${userSegment}/${date}/${crypto.randomUUID()}-${fileSegment}`;
 }
 
-function summarizeCloudflareErrors(body: R2TemporaryCredentialResponse) {
-  const errors = body.errors ?? [];
-  return errors
-    .map((error) => [error.code, error.message].filter(Boolean).join(" "))
-    .filter(Boolean)
-    .join("; ");
+function bytesToHex(bytes: Uint8Array) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function parseTemporaryCredentialResponse(response: Response) {
-  const body = await response.json<R2TemporaryCredentialResponse>().catch(() => null);
-  if (!response.ok || !body?.success) {
-    const message = body ? summarizeCloudflareErrors(body) : "";
-    throw new Error(`R2 temporary credentials API failed: HTTP ${response.status}${message ? ` ${message}` : ""}`);
+async function sha256Hex(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+async function resolveParentSecretAccessKey(parentSecretOrToken: string) {
+  const value = parentSecretOrToken.trim();
+  if (!value) {
+    throw new Error("R2 parent secret is not configured");
   }
 
-  const result = body.result;
-  if (!result?.accessKeyId || !result.secretAccessKey || !result.sessionToken) {
-    throw new Error("R2 temporary credentials API returned an incomplete credential set");
-  }
-  return result;
+  return sha256HexPattern.test(value) ? value.toLowerCase() : sha256Hex(value);
 }
 
 export async function issueR2Credentials(
@@ -61,30 +51,28 @@ export async function issueR2Credentials(
 ) {
   const objectKey = buildObjectKey(input.userId, input.fileName);
   const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.R2_ACCOUNT_ID}/r2/temp-access-credentials`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.R2_PARENT_API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      bucket: env.R2_BUCKET,
-      parentAccessKeyId: env.R2_PARENT_ACCESS_KEY_ID,
-      permission: "object-read-write",
-      ttlSeconds: input.ttlSeconds,
-      objects: [objectKey],
-    }),
-  });
-  const temporaryCredentials = await parseTemporaryCredentialResponse(response);
+  const parentSecretAccessKey = await resolveParentSecretAccessKey(env.R2_PARENT_API_TOKEN);
+  const sessionJwt = await new SignJWT({
+    bucket: env.R2_BUCKET,
+    scope: "object-read-write",
+    paths: { objectPaths: [objectKey] },
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setSubject(env.R2_ACCOUNT_ID)
+    .setIssuer(env.R2_PARENT_ACCESS_KEY_ID)
+    .setAudience(new URL(endpoint).host)
+    .setIssuedAt()
+    .setExpirationTime(`${input.ttlSeconds}s`)
+    .sign(encoder.encode(parentSecretAccessKey));
 
   return {
     accountId: env.R2_ACCOUNT_ID,
     bucket: env.R2_BUCKET,
     endpoint,
     objectKey,
-    accessKeyId: temporaryCredentials.accessKeyId,
-    secretAccessKey: temporaryCredentials.secretAccessKey,
-    sessionToken: temporaryCredentials.sessionToken,
+    accessKeyId: env.R2_PARENT_ACCESS_KEY_ID,
+    secretAccessKey: await sha256Hex(sessionJwt),
+    sessionToken: btoa(`jwt/${sessionJwt}`),
     expiresAt: new Date(Date.now() + input.ttlSeconds * 1000).toISOString(),
   };
 }

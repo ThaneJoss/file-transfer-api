@@ -71,10 +71,10 @@ pnpm wrangler secret list --name file-transfer-api
 ```
 
 `R2_PARENT_ACCESS_KEY_ID` 使用 R2 token 的 Access Key ID。`R2_PARENT_API_TOKEN`
-使用同一个 R2 parent token 的 API token value，Worker 会调用 Cloudflare
-Temporary Credentials API 生成浏览器上传用的短期 S3 凭证。该 R2 token 至少需要目标
-bucket 的 Object Read & Write 权限。所有敏感值只放在 Cloudflare Worker Runtime
-Secrets，不写入 GitHub。
+使用同一个 R2 token 的 Secret Access Key；也兼容原始 API token value，Worker 会先
+派生对应的 Secret Access Key。Worker 在本地签发仅限目标对象的短期 S3 凭证，不调用
+需要 Bearer Token 的 Cloudflare REST API。该 R2 token 至少需要目标 bucket 的 Object
+Read & Write 权限。所有敏感值只放在 Cloudflare Worker Runtime Secrets，不写入 GitHub。
 
 ## R2 CORS
 
