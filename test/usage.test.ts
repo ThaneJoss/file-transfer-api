@@ -85,6 +85,11 @@ function byService(response: UsageSummaryResponse) {
   return new Map(response.summary.map((item) => [item.service, item]));
 }
 
+function decodeBase64UrlJson<T>(value: string): T {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  return JSON.parse(atob(base64)) as T;
+}
+
 describe("usage API", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -232,42 +237,8 @@ describe("usage API", () => {
     expect(body.totalBytes).toBe(1234);
   });
 
-  it("records declared R2 bytes when temporary R2 credentials are issued", async () => {
+  it("records declared R2 bytes when locally signed credentials are issued", async () => {
     const owner = await registerUser("R2 Usage Owner");
-    const r2Fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      expect(String(input)).toBe("https://api.cloudflare.com/client/v4/accounts/test/r2/temp-access-credentials");
-      expect(init?.method).toBe("POST");
-      expect(init?.headers).toEqual({
-        Authorization: "Bearer test",
-        "Content-Type": "application/json",
-      });
-      const body = JSON.parse(String(init?.body)) as {
-        bucket: string;
-        parentAccessKeyId: string;
-        permission: string;
-        ttlSeconds: number;
-        objects: string[];
-      };
-      expect(body).toMatchObject({
-        bucket: "test",
-        parentAccessKeyId: "test",
-        permission: "object-read-write",
-        ttlSeconds: 900,
-      });
-      expect(body.objects).toHaveLength(1);
-      expect(body.objects[0]).toMatch(/\/[0-9a-f-]+-example\.bin$/u);
-
-      return Response.json({
-        success: true,
-        errors: [],
-        messages: [],
-        result: {
-          accessKeyId: "temporary-access-key",
-          secretAccessKey: "temporary-secret-key",
-          sessionToken: "temporary-session-token",
-        },
-      });
-    });
 
     const credentialsResponse = await request(
       "/v1/r2/credentials",
@@ -295,13 +266,34 @@ describe("usage API", () => {
       accountId: "test",
       bucket: "test",
       endpoint: "https://test.r2.cloudflarestorage.com",
-      accessKeyId: "temporary-access-key",
-      secretAccessKey: "temporary-secret-key",
-      sessionToken: "temporary-session-token",
+      accessKeyId: "test",
     });
     expect(credentials.objectKey).toMatch(/\/[0-9a-f-]+-example\.bin$/u);
+    expect(credentials.secretAccessKey).toMatch(/^[a-f0-9]{64}$/u);
     expect(Date.parse(credentials.expiresAt)).toBeGreaterThan(Date.now());
-    expect(r2Fetch).toHaveBeenCalledTimes(1);
+
+    const jwt = atob(credentials.sessionToken).replace(/^jwt\//u, "");
+    const [, payload] = jwt.split(".");
+    const claims = decodeBase64UrlJson<{
+      bucket: string;
+      scope: string;
+      paths: { objectPaths: string[] };
+      sub: string;
+      iss: string;
+      aud: string;
+      iat: number;
+      exp: number;
+    }>(payload);
+
+    expect(claims).toMatchObject({
+      bucket: "test",
+      scope: "object-read-write",
+      paths: { objectPaths: [credentials.objectKey] },
+      sub: "test",
+      iss: "test",
+      aud: "test.r2.cloudflarestorage.com",
+    });
+    expect(claims.exp - claims.iat).toBe(900);
 
     const usageResponse = await request("/v1/usage", {}, owner.jar);
     expect(usageResponse.status).toBe(200);
