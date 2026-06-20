@@ -1,13 +1,25 @@
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
+import {
+  adminHtmlResponse,
+  adminScriptResponse,
+  adminStyleResponse,
+  getAdminStats,
+  getAdminUsers,
+  parseAdminRange,
+  setAdminQuota,
+} from "./admin";
 import { createAuth } from "./auth";
 import { createRegistrationContext, normalizeRegistrationName } from "./passkey-registration";
+import { createPickup, isPickupVariant, pickupCodePattern } from "./pickups";
 import { issueR2Credentials } from "./services/r2";
 import { matchSfuRoute, proxySfuRequest } from "./services/sfu";
 import { issueTurnCredentials } from "./services/turn";
 import { requireSession } from "./session";
 import type { AppEnv, Bindings } from "./types";
 import { getUsageSummary, recordUsage } from "./usage";
+
+export { PickupSession } from "./durable/pickup-session";
 
 const app = new Hono<AppEnv>();
 const maxJsonBodyBytes = 64 * 1024;
@@ -49,7 +61,11 @@ async function readJsonObject(c: Context<AppEnv>) {
   }
 
   try {
-    const value = (await c.req.json()) as unknown;
+    const body = await c.req.text();
+    if (new TextEncoder().encode(body).byteLength > maxJsonBodyBytes) {
+      return { error: c.json({ error: "Request body too large" }, 413) };
+    }
+    const value = JSON.parse(body) as unknown;
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return { error: c.json({ error: "JSON object required" }, 400) };
     }
@@ -92,6 +108,7 @@ app.get("/", (c) => {
     name: "file-transfer-api",
     status: "ok",
     auth: "/api/auth",
+    admin: "/admin/",
     health: "/health",
   });
 });
@@ -107,6 +124,32 @@ app.get("/health", async (c) => {
 
 app.on(["GET", "POST"], "/api/auth/*", (c) => {
   return createAuth(c.env).handler(c.req.raw);
+});
+
+app.get("/admin", (c) => c.redirect("/admin/"));
+app.get("/admin/", () => adminHtmlResponse());
+app.get("/admin/admin.js", () => adminScriptResponse());
+app.get("/admin/admin.css", () => adminStyleResponse());
+app.get("/admin/api/stats", async (c) => {
+  const range = parseAdminRange(new URL(c.req.url));
+  if (!range) return c.json({ error: "Invalid time range or bucket" }, 400);
+  return c.json(await getAdminStats(c.env, range));
+});
+app.get("/admin/api/users", async (c) => c.json(await getAdminUsers(c.env)));
+app.put("/admin/api/users/:userId/quota", async (c) => {
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) return parsed.error;
+  if (Object.keys(parsed.value).some((key) => key !== "service" && key !== "limit")) {
+    return c.json({ error: "Request body may only contain service and limit" }, 400);
+  }
+  const result = await setAdminQuota(
+    c.env,
+    c.req.param("userId"),
+    parsed.value.service,
+    parsed.value.limit,
+  );
+  if ("error" in result) return c.json({ error: result.error }, result.status);
+  return c.json(result);
 });
 
 app.use("/v1/*", async (c, next) => {
@@ -154,6 +197,113 @@ app.get("/v1/usage", async (c) => {
   return c.json(usage);
 });
 
+app.post("/v1/usage/transfers", async (c) => {
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) return parsed.error;
+  if (Object.keys(parsed.value).some((key) => !["service", "bytes", "transferId"].includes(key))) {
+    return c.json({ error: "Request body may only contain service, bytes and transferId" }, 400);
+  }
+  const service = parsed.value.service;
+  const bytes = optionalByteCount(parsed.value.bytes);
+  const transferId = typeof parsed.value.transferId === "string" ? parsed.value.transferId.trim() : "";
+  if (service !== "direct" && service !== "stun") {
+    return c.json({ error: "service must be direct or stun" }, 400);
+  }
+  if (bytes === null || bytes === undefined) {
+    return c.json({ error: "bytes must be a non-negative safe integer" }, 400);
+  }
+  if (!/^[A-Za-z0-9_-]{16,100}$/.test(transferId)) {
+    return c.json({ error: "transferId must be 16 to 100 URL-safe characters" }, 400);
+  }
+  const { userId } = c.get("auth");
+  const recorded = await recordUsage(c.env, {
+    userId,
+    service,
+    quantity: bytes,
+    idempotencyKey: `${userId}:${service}:${transferId}`,
+    metadata: { source: "completed_data_channel_transfer", transferId },
+  });
+  return recorded ? c.json({ recorded: true }, 201) : c.json({ recorded: false }, 200);
+});
+
+app.get("/v1/pickups/:code/answer", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getAnswer(userId);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "get_answer" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
+  if (result.status === "found") return c.json({ answer: result.answer });
+  return c.json({ error: "Pickup code not found or expired" }, 404);
+});
+
+app.put("/v1/pickups/:code/answer", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) return parsed.error;
+  if (Object.keys(parsed.value).length !== 1 || typeof parsed.value.answer !== "string") {
+    return c.json({ error: "Request body must contain only answer" }, 400);
+  }
+  const answer = parsed.value.answer.trim();
+  if (!answer || answer.length > 60_000) return c.json({ error: "answer must be 1 to 60000 characters" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).submitAnswer(userId, answer);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "submit_answer" },
+  });
+  if (result.status === "answered") return c.json({ error: "Pickup code already has an answer" }, 409);
+  if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
+  return c.json({ accepted: true });
+});
+
+app.get("/v1/pickups/:code", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getOffer();
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "get_offer" },
+  });
+  if (result.status !== "found") return c.json({ error: "Pickup code not found or expired" }, 404);
+  return c.json(result);
+});
+
+app.post("/v1/pickups", async (c) => {
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) return parsed.error;
+  if (Object.keys(parsed.value).some((key) => key !== "variant" && key !== "offer")) {
+    return c.json({ error: "Request body may only contain variant and offer" }, 400);
+  }
+  const offer = typeof parsed.value.offer === "string" ? parsed.value.offer.trim() : "";
+  if (!isPickupVariant(parsed.value.variant)) return c.json({ error: "variant must be direct or stun" }, 400);
+  if (!offer || offer.length > 60_000) return c.json({ error: "offer must be 1 to 60000 characters" }, 400);
+  const { userId } = c.get("auth");
+  const pickup = await createPickup(c.env, {
+    senderUserId: userId,
+    variant: parsed.value.variant,
+    offer,
+  });
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "create_pickup" },
+  });
+  return c.json(pickup, 201);
+});
+
 app.post("/v1/turn/credentials", async (c) => {
   const parsed = await readJsonObject(c);
   if ("error" in parsed) {
@@ -176,7 +326,7 @@ app.post("/v1/turn/credentials", async (c) => {
       await recordUsage(c.env, {
         userId,
         service: "turn",
-        bytes: fileSizeBytes,
+        quantity: fileSizeBytes,
         action: "turn.relay.bytes",
         metadata: {
           ttlSeconds,
@@ -221,7 +371,7 @@ app.post("/v1/r2/credentials", async (c) => {
       await recordUsage(c.env, {
         userId,
         service: "r2",
-        bytes: fileSizeBytes,
+        quantity: fileSizeBytes,
         action: "r2.upload.bytes",
         metadata: {
           fileName,
