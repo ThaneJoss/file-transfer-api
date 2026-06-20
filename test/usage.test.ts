@@ -85,6 +85,11 @@ function byService(response: UsageSummaryResponse) {
   return new Map(response.summary.map((item) => [item.service, item]));
 }
 
+function decodeBase64UrlJson<T>(value: string): T {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  return JSON.parse(atob(base64)) as T;
+}
+
 describe("usage API", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -230,5 +235,70 @@ describe("usage API", () => {
     expect(summary.get("sfu")?.bytes).toBe(0);
     expect(summary.get("r2")?.bytes).toBe(0);
     expect(body.totalBytes).toBe(1234);
+  });
+
+  it("records declared R2 bytes when locally signed credentials are issued", async () => {
+    const owner = await registerUser("R2 Usage Owner");
+
+    const credentialsResponse = await request(
+      "/v1/r2/credentials",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileName: "example.bin", ttlSeconds: 900, fileSizeBytes: 2345 }),
+      },
+      owner.jar,
+    );
+
+    expect(credentialsResponse.status).toBe(201);
+    const credentials = await credentialsResponse.json<{
+      accountId: string;
+      bucket: string;
+      endpoint: string;
+      objectKey: string;
+      accessKeyId: string;
+      secretAccessKey: string;
+      sessionToken: string;
+    }>();
+
+    expect(credentials).toMatchObject({
+      accountId: "test",
+      bucket: "test",
+      endpoint: "https://test.r2.cloudflarestorage.com",
+      accessKeyId: "test",
+    });
+    expect(credentials.objectKey).toMatch(/\/[0-9a-f-]+-example\.bin$/u);
+    expect(credentials.secretAccessKey).toMatch(/^[a-f0-9]{64}$/u);
+
+    const jwt = atob(credentials.sessionToken).replace(/^jwt\//u, "");
+    const [, payload] = jwt.split(".");
+    const claims = decodeBase64UrlJson<{
+      bucket: string;
+      scope: string;
+      paths: { objectPaths: string[] };
+      sub: string;
+      iss: string;
+      aud: string;
+      iat: number;
+      exp: number;
+    }>(payload);
+
+    expect(claims).toMatchObject({
+      bucket: "test",
+      scope: "object-read-write",
+      paths: { objectPaths: [credentials.objectKey] },
+      sub: "test",
+      iss: "test",
+      aud: "test.r2.cloudflarestorage.com",
+    });
+    expect(claims.exp - claims.iat).toBe(900);
+
+    const usageResponse = await request("/v1/usage", {}, owner.jar);
+    expect(usageResponse.status).toBe(200);
+    const body = await usageResponse.json<UsageSummaryResponse>();
+    const summary = byService(body);
+
+    expect(summary.get("r2")?.bytes).toBe(2345);
+    expect(body.totalBytes).toBe(2345);
   });
 });

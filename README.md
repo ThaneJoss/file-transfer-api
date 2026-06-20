@@ -70,8 +70,11 @@ pnpm wrangler secret put SFU_APP_TOKEN --name file-transfer-api
 pnpm wrangler secret list --name file-transfer-api
 ```
 
-R2 parent token 至少需要目标 bucket 的 Object Read & Write 权限。所有值只放在
-Cloudflare Worker Runtime Secrets，不写入 GitHub。
+`R2_PARENT_ACCESS_KEY_ID` 使用 R2 token 的 Access Key ID。`R2_PARENT_API_TOKEN`
+用于 Worker 本地签发临时凭证，可填写 R2 token 的 Secret Access Key；如果填写原始
+API token value，Worker 会先派生 Secret Access Key。该 R2 token 至少需要目标
+bucket 的 Object Read & Write 权限。所有值只放在 Cloudflare Worker Runtime
+Secrets，不写入 GitHub。
 
 ## D1
 
