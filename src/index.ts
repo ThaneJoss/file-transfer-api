@@ -164,9 +164,26 @@ app.post("/v1/turn/credentials", async (c) => {
   if (ttlSeconds === null) {
     return c.json({ error: "ttlSeconds must be an integer from 60 to 86400" }, 400);
   }
+  const fileSizeBytes = optionalByteCount(parsed.value.fileSizeBytes);
+  if (fileSizeBytes === null) {
+    return c.json({ error: "fileSizeBytes must be a non-negative safe integer" }, 400);
+  }
 
   try {
+    const { userId } = c.get("auth");
     const credentials = await issueTurnCredentials(c.env, ttlSeconds);
+    if (fileSizeBytes !== undefined) {
+      await recordUsage(c.env, {
+        userId,
+        service: "turn",
+        bytes: fileSizeBytes,
+        action: "turn.relay.bytes",
+        metadata: {
+          ttlSeconds,
+          source: "declared_file_size",
+        },
+      });
+    }
     return c.json(credentials, 201);
   } catch (error) {
     logUpstreamError("turn", error);
