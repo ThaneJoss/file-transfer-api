@@ -41,14 +41,17 @@ Worker 只负责：
 
 1. Better Auth Passkey 注册、登录和 session 校验。
 2. 托管 TURN、R2、SFU 长期密钥，向已登录用户提供短期或受限访问。
-3. 将成功的凭证签发和 SFU 控制面调用写入 `usage_event`。
+3. 将后端可确认的用户流量字节写入 `usage_event`。
 
 TURN 返回短期 `iceServers`。R2 返回仅限一个服务端生成对象 key 的临时 S3
 凭证。Cloudflare Realtime SFU 没有可下发给浏览器的短期 App Token，因此
 Worker 只代理文件传输需要的控制面接口，长期 App Token 不离开 Worker。
 
-文件数据不经过 Worker。`usage_event` 当前记录控制面事件；TURN、SFU 和 R2
-实际流量字节后续需要从 Cloudflare Analytics 对账。
+文件数据不经过 Worker。`usage_event.bytes` 只记录后端能确认的流量字节；
+`credential.issued`、`session.create` 等控制面次数不作为额度依据。R2 凭证接口
+可接收 `fileSizeBytes` 记录上传文件大小。TURN relay 和 SFU data channel 的精确
+per-user bytes 需要 Cloudflare 侧可归属的流量回传或后续专门埋点；在没有可信来源前，
+API 不用发证/会话次数冒充流量。
 
 ## 运行时密钥
 
@@ -174,7 +177,7 @@ curl https://api.file.thanejoss.com/health
 - `GET|POST /api/auth/*`
 - `POST /v1/passkey/registration-context`，公开，仅签发短期一次性注册上下文
 - `GET /v1/me`，需要 Better Auth session
-- `GET /v1/usage`，返回当前用户的事件汇总
+- `GET /v1/usage`，返回当前用户 UTC 当月 TURN/SFU/R2 bytes 汇总
 - `POST /v1/turn/credentials`
 - `POST /v1/r2/credentials`
 - `POST|PUT /v1/sfu/*`，仅允许文件传输所需的 SFU 控制面操作
@@ -190,6 +193,27 @@ await fetch("https://api.file.thanejoss.com/v1/turn/credentials", {
 });
 ```
 
+`GET /v1/usage` 返回结构：
+
+```json
+{
+  "period": {
+    "start": "2026-06-01T00:00:00.000Z",
+    "end": "2026-06-20T04:40:00.000Z",
+    "timezone": "UTC"
+  },
+  "summary": [
+    { "service": "turn", "bytes": 0, "quotaBytes": null },
+    { "service": "sfu", "bytes": 0, "quotaBytes": null },
+    { "service": "r2", "bytes": 0, "quotaBytes": null }
+  ],
+  "totalBytes": 0,
+  "totalQuotaBytes": null
+}
+```
+
+`quotaBytes` 字段保留给前端稳定渲染；当前没有后端额度来源时返回 `null`。
+
 TURN 请求体：
 
 ```json
@@ -199,12 +223,13 @@ TURN 请求体：
 R2 请求体：
 
 ```json
-{"fileName":"example.bin","ttlSeconds":900}
+{"fileName":"example.bin","ttlSeconds":900,"fileSizeBytes":123456}
 ```
 
 R2 响应包含 `accountId`、`bucket`、`endpoint`、服务端生成的 `objectKey`，
 以及 `accessKeyId`、`secretAccessKey`、`sessionToken`、`expiresAt`。前端的
-S3 签名实现必须同时发送 `sessionToken`。
+S3 签名实现必须同时发送 `sessionToken`。`fileSizeBytes` 可省略；省略时后端
+无法确认本次上传大小，因此不会写入 R2 bytes 用量。
 
 SFU 代理路径与 Cloudflare Realtime 的应用内路径一致，例如：
 

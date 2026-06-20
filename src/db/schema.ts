@@ -122,7 +122,7 @@ export const usageEvent = sqliteTable(
       .references(() => user.id, { onDelete: "cascade" }),
     service: text("service", { enum: ["turn", "r2", "sfu"] }).notNull(),
     action: text("action").notNull(),
-    quantity: integer("quantity").notNull().default(1),
+    bytes: integer("bytes").notNull().default(0),
     metadata: text("metadata", { mode: "json" }).$type<Record<string, unknown>>(),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   },
