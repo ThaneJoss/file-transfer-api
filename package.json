@@ -6,7 +6,11 @@
   "packageManager": "pnpm@11.6.0",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "pnpm run r2:preflight && wrangler deploy",
+    "deploy:preview": "pnpm run r2:preflight && wrangler versions upload",
+    "r2:preflight": "node scripts/check-r2-access.mjs",
+    "r2:cors:apply": "wrangler r2 bucket cors set \"$R2_BUCKET\" --file config/r2-cors.json --force",
+    "r2:cors:list": "wrangler r2 bucket cors list \"$R2_BUCKET\"",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "cf-typegen": "wrangler types worker-configuration.d.ts --include-runtime=false",
@@ -19,6 +23,7 @@
   "dependencies": {
     "@better-auth/drizzle-adapter": "^1.6.19",
     "@better-auth/passkey": "1.6.19",
+    "aws4fetch": "^1.0.20",
     "better-auth": "^1.6.19",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.26"

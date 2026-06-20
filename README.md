@@ -24,13 +24,25 @@ Production branch: main
 Root directory: /
 Build command: 留空
 Deploy command: pnpm run deploy
-Non-production branch deploy command: pnpm wrangler versions upload
+Non-production branch deploy command: pnpm run deploy:preview
 ```
 
 Build Variables:
 
 ```txt
 PNPM_VERSION=11.6.0
+```
+
+Build Variables / Secrets 还需要配置以下 R2 值，供部署前 `pnpm run r2:preflight`
+访问 Cloudflare Temporary Credentials API、执行 `ListObjectsV2`，并检查 bucket
+CORS。Workers runtime secrets 不会自动暴露给 deploy script，所以这里需要单独配置：
+
+```txt
+APP_ORIGIN=https://file.thanejoss.com
+R2_ACCOUNT_ID=<account-id>
+R2_BUCKET=<bucket-name>
+R2_PARENT_ACCESS_KEY_ID=<parent-r2-access-key-id>
+R2_PARENT_API_TOKEN=<parent-r2-api-token-value>
 ```
 
 `main` 已配置 GitHub ruleset，只能通过 PR 更新。
@@ -71,10 +83,38 @@ pnpm wrangler secret list --name file-transfer-api
 ```
 
 `R2_PARENT_ACCESS_KEY_ID` 使用 R2 token 的 Access Key ID。`R2_PARENT_API_TOKEN`
-用于 Worker 本地签发临时凭证，可填写 R2 token 的 Secret Access Key；如果填写原始
-API token value，Worker 会先派生 Secret Access Key。该 R2 token 至少需要目标
-bucket 的 Object Read & Write 权限。所有值只放在 Cloudflare Worker Runtime
-Secrets，不写入 GitHub。
+使用同一个 R2 parent token 的 API token value，Worker 会调用 Cloudflare
+Temporary Credentials API 生成浏览器上传用的短期 S3 凭证。该 R2 token 至少需要目标
+bucket 的 Object Read & Write 权限。所有敏感值只放在 Cloudflare Worker Runtime
+Secrets 和 Workers Builds build secrets，不写入 GitHub。
+
+## R2 CORS
+
+浏览器会直接向 R2 发送 `PUT`，并从预签名 URL 执行 `GET`。bucket CORS 需要允许生产
+前端 origin、`GET`/`PUT`，以及上传请求实际发送的签名头：
+
+```sh
+pnpm r2:cors:apply
+pnpm r2:cors:list
+```
+
+当前仓库的 Wrangler CORS 文件是 `config/r2-cors.json`，等价策略为：
+
+```json
+{
+  "AllowedOrigins": ["https://file.thanejoss.com"],
+  "AllowedMethods": ["GET", "PUT"],
+  "AllowedHeaders": [
+    "Authorization",
+    "Content-Type",
+    "x-amz-content-sha256",
+    "x-amz-date",
+    "x-amz-security-token"
+  ],
+  "ExposeHeaders": ["ETag", "Content-Length", "Content-Type"],
+  "MaxAgeSeconds": 3600
+}
+```
 
 ## D1
 
