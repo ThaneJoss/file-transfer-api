@@ -3,9 +3,10 @@ import type { PickupVariant } from "./durable/pickup-session";
 
 export const pickupCodePattern = /^\d{8}$/;
 export const pickupLifetimeMs = 60 * 60 * 1000;
+export const pickupVariants = ["direct", "stun", "turn", "sfu", "r2"] as const satisfies readonly PickupVariant[];
 
 export function isPickupVariant(value: unknown): value is PickupVariant {
-  return value === "direct" || value === "stun";
+  return typeof value === "string" && pickupVariants.includes(value as PickupVariant);
 }
 
 export async function createPickup(

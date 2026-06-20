@@ -287,7 +287,7 @@ app.post("/v1/pickups", async (c) => {
     return c.json({ error: "Request body may only contain variant and offer" }, 400);
   }
   const offer = typeof parsed.value.offer === "string" ? parsed.value.offer.trim() : "";
-  if (!isPickupVariant(parsed.value.variant)) return c.json({ error: "variant must be direct or stun" }, 400);
+  if (!isPickupVariant(parsed.value.variant)) return c.json({ error: "variant must be direct, stun, turn, sfu or r2" }, 400);
   if (!offer || offer.length > 60_000) return c.json({ error: "offer must be 1 to 60000 characters" }, 400);
   const { userId } = c.get("auth");
   const pickup = await createPickup(c.env, {
