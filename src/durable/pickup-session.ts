@@ -26,13 +26,18 @@ type PickupRecord = {
 
 type LookupResult =
   | { status: "found"; variant: PickupVariant; offer: string; expiresAt: number; answered: boolean }
+  | { status: "pending"; variant: PickupVariant; expiresAt: number }
   | { status: "missing" | "expired" | "cancelled" };
+
+type PublishOfferResult = {
+  status: "ok" | "missing" | "expired" | "forbidden" | "published" | "answered" | "cancelled";
+};
 
 type AnswerResult =
   | { status: "found"; answer: string | null }
   | { status: "missing" | "expired" | "forbidden" | "cancelled" };
 
-type SubmitResult = { status: "ok" | "missing" | "expired" | "answered" | "cancelled" };
+type SubmitResult = { status: "ok" | "missing" | "expired" | "pending" | "answered" | "cancelled" };
 
 type SelectionResult =
   | { status: "found"; route: PickupRoute | null }
@@ -57,6 +62,8 @@ type StatusResult =
   | { status: "missing" | "expired" | "forbidden" };
 
 export class PickupSession extends DurableObject<Bindings> {
+  private readonly offerWaiters = new Set<() => void>();
+
   constructor(ctx: DurableObjectState, env: Bindings) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -88,7 +95,7 @@ export class PickupSession extends DurableObject<Bindings> {
   async reserve(input: {
     senderUserId: string;
     variant: PickupVariant;
-    offer: string;
+    offer?: string;
     expiresAt: number;
   }): Promise<boolean> {
     const now = Date.now();
@@ -103,7 +110,7 @@ export class PickupSession extends DurableObject<Bindings> {
        VALUES (1, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)`,
       input.senderUserId,
       input.variant,
-      input.offer,
+      input.offer ?? "",
       input.expiresAt,
       now,
     );
@@ -111,10 +118,26 @@ export class PickupSession extends DurableObject<Bindings> {
     return true;
   }
 
-  async getOffer(): Promise<LookupResult> {
+  async getOffer(waitMs = 0): Promise<LookupResult> {
+    let result = this.readOfferResult();
+    if (result.status === "pending" && waitMs > 0) {
+      await this.waitForOfferChange(waitMs);
+      result = this.readOfferResult();
+    }
+    return result;
+  }
+
+  private readOfferResult(): LookupResult {
     const record = this.readActiveRecord();
     if (!record) return this.readRecord() ? { status: "expired" } : { status: "missing" };
     if (record.cancelled_at !== null) return { status: "cancelled" };
+    if (!record.offer) {
+      return {
+        status: "pending",
+        variant: record.variant,
+        expiresAt: record.expires_at,
+      };
+    }
     return {
       status: "found",
       variant: record.variant,
@@ -124,10 +147,31 @@ export class PickupSession extends DurableObject<Bindings> {
     };
   }
 
+  async publishOffer(senderUserId: string, offer: string): Promise<PublishOfferResult> {
+    const record = this.readActiveRecord();
+    if (!record) return { status: this.readRecord() ? "expired" : "missing" };
+    if (record.sender_user_id !== senderUserId) return { status: "forbidden" };
+    if (record.cancelled_at !== null) return { status: "cancelled" };
+    if (record.offer === offer) return { status: "ok" };
+    if (record.offer) return { status: "published" };
+    if (record.answer !== null) return { status: "answered" };
+
+    const result = this.ctx.storage.sql.exec(
+      "UPDATE pickup_session SET offer = ? WHERE singleton = 1 AND offer = '' AND answer IS NULL",
+      offer,
+    );
+    if (result.rowsWritten === 1) {
+      this.notifyOfferWaiters();
+      return { status: "ok" };
+    }
+    return { status: "published" };
+  }
+
   async submitAnswer(receiverUserId: string, answer: string): Promise<SubmitResult> {
     const record = this.readActiveRecord();
     if (!record) return this.readRecord() ? { status: "expired" } : { status: "missing" };
     if (record.cancelled_at !== null) return { status: "cancelled" };
+    if (!record.offer) return { status: "pending" };
     if (record.answer !== null) return { status: "answered" };
 
     this.ctx.storage.sql.exec(
@@ -221,6 +265,7 @@ export class PickupSession extends DurableObject<Bindings> {
         "UPDATE pickup_session SET cancelled_at = ? WHERE singleton = 1 AND cancelled_at IS NULL",
         Date.now(),
       );
+      this.notifyOfferWaiters();
     }
     return { status: "ok" };
   }
@@ -240,6 +285,7 @@ export class PickupSession extends DurableObject<Bindings> {
 
   async alarm(): Promise<void> {
     this.ctx.storage.sql.exec("DELETE FROM pickup_session WHERE expires_at <= ?", Date.now());
+    this.notifyOfferWaiters();
   }
 
   private readRecord() {
@@ -256,5 +302,22 @@ export class PickupSession extends DurableObject<Bindings> {
     if (!columns.some((column) => column.name === name)) {
       this.ctx.storage.sql.exec(`ALTER TABLE pickup_session ADD COLUMN ${name} ${type}`);
     }
+  }
+
+  private waitForOfferChange(waitMs: number) {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        globalThis.clearTimeout(timer);
+        this.offerWaiters.delete(done);
+        resolve();
+      };
+      timer = globalThis.setTimeout(done, waitMs);
+      this.offerWaiters.add(done);
+    });
+  }
+
+  private notifyOfferWaiters() {
+    for (const done of [...this.offerWaiters]) done();
   }
 }
