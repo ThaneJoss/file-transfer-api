@@ -186,7 +186,7 @@ describe("usage API", () => {
     expect(body.period.timezone).toBe("UTC");
   });
 
-  it("records declared TURN bytes when credentials are issued", async () => {
+  it("does not record declared TURN bytes when credentials are issued", async () => {
     const owner = await registerUser("TURN Usage Owner");
     const turnFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(String(input)).toBe(
@@ -231,13 +231,13 @@ describe("usage API", () => {
     const body = await usageResponse.json<UsageSummaryResponse>();
     const summary = byService(body);
 
-    expect(summary.get("turn")?.bytes).toBe(1234);
+    expect(summary.get("turn")?.bytes).toBe(0);
     expect(summary.get("sfu")?.bytes).toBe(0);
     expect(summary.get("r2")?.bytes).toBe(0);
-    expect(body.totalBytes).toBe(1234);
+    expect(body.totalBytes).toBe(0);
   });
 
-  it("records declared R2 bytes when locally signed credentials are issued", async () => {
+  it("does not record declared R2 bytes when locally signed credentials are issued", async () => {
     const owner = await registerUser("R2 Usage Owner");
 
     const credentialsResponse = await request(
@@ -300,7 +300,7 @@ describe("usage API", () => {
     const body = await usageResponse.json<UsageSummaryResponse>();
     const summary = byService(body);
 
-    expect(summary.get("r2")?.bytes).toBe(2345);
-    expect(body.totalBytes).toBe(2345);
+    expect(summary.get("r2")?.bytes).toBe(0);
+    expect(body.totalBytes).toBe(0);
   });
 });

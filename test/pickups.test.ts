@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { UsageSummaryResponse } from "../src/usage";
-import { registerUser, request } from "./support";
+import { bindings, registerUser, request } from "./support";
 
 describe("pickup code API", () => {
   it("requires a session for every pickup operation", async () => {
@@ -78,7 +78,7 @@ describe("pickup code API", () => {
     const sender = await registerUser("Pickup Variant Sender");
     const receiver = await registerUser("Pickup Variant Receiver");
 
-    for (const variant of ["turn", "sfu", "r2"] as const) {
+    for (const variant of ["turn", "sfu", "r2", "multipath"] as const) {
       const createResponse = await request(
         "/v1/pickups",
         {
@@ -101,29 +101,432 @@ describe("pickup code API", () => {
     }
   });
 
-  it("records completed Direct/STUN bytes idempotently", async () => {
-    const user = await registerUser("Transfer Usage");
-    const body = JSON.stringify({
-      service: "direct",
-      bytes: 12345,
-      transferId: crypto.randomUUID(),
+  it("accepts 384 KiB pickup signals and rejects bodies above the coordinated limit", async () => {
+    const sender = await registerUser("Large Pickup Sender");
+    const receiver = await registerUser("Large Pickup Receiver");
+    const offer = "o".repeat(384 * 1024);
+    const answer = "a".repeat(384 * 1024);
+
+    const createResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer }),
+      },
+      sender.jar,
+    );
+    expect(createResponse.status).toBe(201);
+    const pickup = await createResponse.json<{ code: string }>();
+
+    const offerResponse = await request(`/v1/pickups/${pickup.code}`, {}, receiver.jar);
+    expect(offerResponse.status).toBe(200);
+    expect((await offerResponse.json<{ offer: string }>()).offer).toBe(offer);
+
+    const answerResponse = await request(
+      `/v1/pickups/${pickup.code}/answer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer }),
+      },
+      receiver.jar,
+    );
+    expect(answerResponse.status).toBe(200);
+
+    const oversizedSignalResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "x".repeat(384 * 1024 + 1) }),
+      },
+      sender.jar,
+    );
+    expect(oversizedSignalResponse.status).toBe(400);
+    expect(await oversizedSignalResponse.json()).toEqual({ error: "offer must be 1 to 393216 UTF-8 bytes" });
+
+    const oversizedResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "x".repeat(385 * 1024) }),
+      },
+      sender.jar,
+    );
+    expect(oversizedResponse.status).toBe(413);
+    expect(await oversizedResponse.json()).toEqual({ error: "Request body too large" });
+  });
+
+  it("coordinates sender selection updates and a receiver winner exactly once", async () => {
+    const sender = await registerUser("Multipath Sender");
+    const receiver = await registerUser("Multipath Receiver");
+    const createResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "multipath-offer" }),
+      },
+      sender.jar,
+    );
+    const pickup = await createResponse.json<{ code: string }>();
+
+    const emptyWinner = await request(`/v1/pickups/${pickup.code}/winner`, {}, sender.jar);
+    expect(emptyWinner.status).toBe(404);
+    expect(await emptyWinner.json()).toEqual({ error: "Pickup winner not confirmed yet" });
+
+    const answerResponse = await request(
+      `/v1/pickups/${pickup.code}/answer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer: "multipath-answer" }),
+      },
+      receiver.jar,
+    );
+    expect(answerResponse.status).toBe(200);
+
+    const emptySelection = await request(`/v1/pickups/${pickup.code}/selection`, {}, receiver.jar);
+    expect(emptySelection.status).toBe(404);
+    expect(await emptySelection.json()).toEqual({ error: "Pickup route not selected yet" });
+
+    const selectionResponse = await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "stun" }),
+      },
+      sender.jar,
+    );
+    expect(selectionResponse.status).toBe(200);
+    expect(await selectionResponse.json()).toEqual({ accepted: true });
+
+    const repeatedSelection = await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "stun" }),
+      },
+      sender.jar,
+    );
+    expect(repeatedSelection.status).toBe(200);
+    expect(await repeatedSelection.json()).toEqual({ accepted: true });
+
+    const updatedSelection = await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "r2" }),
+      },
+      sender.jar,
+    );
+    expect(updatedSelection.status).toBe(200);
+    expect(await updatedSelection.json()).toEqual({ accepted: true });
+
+    const readSelection = await request(`/v1/pickups/${pickup.code}/selection`, {}, receiver.jar);
+    expect(await readSelection.json()).toEqual({ route: "r2" });
+
+    const winnerCandidates = [
+      { route: "stun", bytes: 12_345, sha256: "AB".repeat(32) },
+      { route: "r2", bytes: 1, sha256: "cd".repeat(32) },
+    ] as const;
+    const winnerResponses = await Promise.all(
+      winnerCandidates.map((winner) =>
+        request(
+          `/v1/pickups/${pickup.code}/winner`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(winner),
+          },
+          receiver.jar,
+        ),
+      ),
+    );
+    expect(winnerResponses.map((response) => response.status).sort()).toEqual([200, 409]);
+    const acceptedWinner = winnerCandidates[winnerResponses.findIndex((response) => response.status === 200)];
+    expect(acceptedWinner).toBeDefined();
+    if (!acceptedWinner) throw new Error("Expected one winner request to be accepted");
+
+    const readWinner = await request(`/v1/pickups/${pickup.code}/winner`, {}, sender.jar);
+    expect(readWinner.status).toBe(200);
+    expect(await readWinner.json()).toEqual({
+      ...acceptedWinner,
+      sha256: acceptedWinner.sha256.toLowerCase(),
     });
-    const first = await request(
-      "/v1/usage/transfers",
-      { method: "POST", headers: { "Content-Type": "application/json" }, body },
-      user.jar,
+
+    const repeatedWinner = await request(
+      `/v1/pickups/${pickup.code}/winner`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(acceptedWinner),
+      },
+      receiver.jar,
     );
-    const retry = await request(
-      "/v1/usage/transfers",
-      { method: "POST", headers: { "Content-Type": "application/json" }, body },
-      user.jar,
+    expect(repeatedWinner.status).toBe(200);
+    expect(await repeatedWinner.json()).toEqual({ accepted: true });
+
+    const selectionAfterWinner = await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "turn" }),
+      },
+      sender.jar,
     );
-    expect(first.status).toBe(201);
-    expect(retry.status).toBe(200);
-    expect(await retry.json()).toEqual({ recorded: false });
+    expect(selectionAfterWinner.status).toBe(409);
+    expect(await selectionAfterWinner.json()).toEqual({ error: "Pickup code already has a winning route" });
+
+    const cancelAfterWinner = await request(
+      `/v1/pickups/${pickup.code}/cancel`,
+      { method: "PUT" },
+      receiver.jar,
+    );
+    expect(cancelAfterWinner.status).toBe(409);
+    expect(await cancelAfterWinner.json()).toEqual({ error: "Pickup code already has a winning route" });
+  });
+
+  it("restricts coordination to the sender and the receiver bound by answer", async () => {
+    const sender = await registerUser("Coordination Sender");
+    const receiver = await registerUser("Coordination Receiver");
+    const outsider = await registerUser("Coordination Outsider");
+    const createResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "offer" }),
+      },
+      sender.jar,
+    );
+    const pickup = await createResponse.json<{ code: string }>();
+
+    const unboundSelection = await request(`/v1/pickups/${pickup.code}/selection`, {}, outsider.jar);
+    expect(unboundSelection.status).toBe(403);
+    const unboundWinner = await request(
+      `/v1/pickups/${pickup.code}/winner`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "direct", bytes: 0, sha256: "00".repeat(32) }),
+      },
+      outsider.jar,
+    );
+    expect(unboundWinner.status).toBe(403);
+
+    const bindReceiver = await request(
+      `/v1/pickups/${pickup.code}/answer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer: "answer" }),
+      },
+      receiver.jar,
+    );
+    expect(bindReceiver.status).toBe(200);
+
+    const receiverSelectionWrite = await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "direct" }),
+      },
+      receiver.jar,
+    );
+    expect(receiverSelectionWrite.status).toBe(403);
+    const senderSelectionRead = await request(`/v1/pickups/${pickup.code}/selection`, {}, sender.jar);
+    expect(senderSelectionRead.status).toBe(403);
+    const receiverWinnerRead = await request(`/v1/pickups/${pickup.code}/winner`, {}, receiver.jar);
+    expect(receiverWinnerRead.status).toBe(403);
+    const senderWinnerWrite = await request(
+      `/v1/pickups/${pickup.code}/winner`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "direct", bytes: 0, sha256: "00".repeat(32) }),
+      },
+      sender.jar,
+    );
+    expect(senderWinnerWrite.status).toBe(403);
+    const outsiderSelectionRead = await request(`/v1/pickups/${pickup.code}/selection`, {}, outsider.jar);
+    expect(outsiderSelectionRead.status).toBe(403);
+
+    const invalidSelection = await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "multipath" }),
+      },
+      sender.jar,
+    );
+    expect(invalidSelection.status).toBe(400);
+    const invalidWinner = await request(
+      `/v1/pickups/${pickup.code}/winner`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: "direct", bytes: -1, sha256: "00".repeat(32) }),
+      },
+      receiver.jar,
+    );
+    expect(invalidWinner.status).toBe(400);
+  });
+
+  it("lets either transfer side cancel and exposes cancellation to both sides", async () => {
+    const sender = await registerUser("Cancellation Sender");
+    const receiver = await registerUser("Cancellation Receiver");
+    const outsider = await registerUser("Cancellation Outsider");
+    const createResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "cancel-offer" }),
+      },
+      sender.jar,
+    );
+    const pickup = await createResponse.json<{ code: string; expiresAt: number }>();
+
+    const senderStatus = await request(`/v1/pickups/${pickup.code}/status`, {}, sender.jar);
+    expect(senderStatus.status).toBe(200);
+    expect(await senderStatus.json()).toEqual({ cancelled: false, expiresAt: pickup.expiresAt });
+
+    const unboundStatus = await request(`/v1/pickups/${pickup.code}/status`, {}, outsider.jar);
+    expect(unboundStatus.status).toBe(403);
+    const outsiderCancel = await request(
+      `/v1/pickups/${pickup.code}/cancel`,
+      { method: "PUT" },
+      outsider.jar,
+    );
+    expect(outsiderCancel.status).toBe(403);
+
+    const answerResponse = await request(
+      `/v1/pickups/${pickup.code}/answer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer: "cancel-answer" }),
+      },
+      receiver.jar,
+    );
+    expect(answerResponse.status).toBe(200);
+    const receiverStatus = await request(`/v1/pickups/${pickup.code}/status`, {}, receiver.jar);
+    expect(receiverStatus.status).toBe(200);
+    expect(await receiverStatus.json()).toEqual({ cancelled: false, expiresAt: pickup.expiresAt });
+
+    const receiverCancel = await request(
+      `/v1/pickups/${pickup.code}/cancel`,
+      { method: "PUT" },
+      receiver.jar,
+    );
+    expect(receiverCancel.status).toBe(200);
+    expect(await receiverCancel.json()).toEqual({ cancelled: true });
+    const repeatedCancel = await request(
+      `/v1/pickups/${pickup.code}/cancel`,
+      { method: "PUT" },
+      sender.jar,
+    );
+    expect(repeatedCancel.status).toBe(200);
+    expect(await repeatedCancel.json()).toEqual({ cancelled: true });
+
+    for (const [jar, expectedStatus] of [
+      [sender.jar, 200],
+      [receiver.jar, 200],
+      [outsider.jar, 403],
+    ] as const) {
+      const statusResponse = await request(`/v1/pickups/${pickup.code}/status`, {}, jar);
+      expect(statusResponse.status).toBe(expectedStatus);
+      if (expectedStatus === 200) {
+        expect(await statusResponse.json()).toEqual({ cancelled: true, expiresAt: pickup.expiresAt });
+      }
+    }
+
+    const cancelledRequests = await Promise.all([
+      request(`/v1/pickups/${pickup.code}`, {}, receiver.jar),
+      request(`/v1/pickups/${pickup.code}/answer`, {}, sender.jar),
+      request(
+        `/v1/pickups/${pickup.code}/answer`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answer: "replacement-answer" }),
+        },
+        outsider.jar,
+      ),
+      request(`/v1/pickups/${pickup.code}/selection`, {}, receiver.jar),
+      request(
+        `/v1/pickups/${pickup.code}/selection`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ route: "direct" }),
+        },
+        sender.jar,
+      ),
+      request(`/v1/pickups/${pickup.code}/winner`, {}, sender.jar),
+      request(
+        `/v1/pickups/${pickup.code}/winner`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ route: "direct", bytes: 0, sha256: "00".repeat(32) }),
+        },
+        receiver.jar,
+      ),
+    ]);
+    expect(cancelledRequests.map((response) => response.status)).toEqual([410, 410, 410, 410, 410, 410, 410]);
+    for (const response of cancelledRequests) {
+      expect(await response.json()).toEqual({ error: "Pickup transfer was cancelled" });
+    }
+  });
+
+  it("records all five verified transfer services independently and idempotently", async () => {
+    const user = await registerUser("Transfer Usage");
+    const transferId = crypto.randomUUID();
+    const services = ["direct", "stun", "turn", "sfu", "r2"] as const;
+
+    for (const [index, service] of services.entries()) {
+      const body = JSON.stringify({ service, bytes: 10_000 + index, transferId });
+      const first = await request(
+        "/v1/usage/transfers",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body },
+        user.jar,
+      );
+      const retry = await request(
+        "/v1/usage/transfers",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body },
+        user.jar,
+      );
+      expect(first.status).toBe(201);
+      expect(await first.json()).toEqual({ recorded: true });
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toEqual({ recorded: false });
+    }
 
     const usageResponse = await request("/v1/usage", {}, user.jar);
     const usage = await usageResponse.json<UsageSummaryResponse>();
-    expect(usage.summary.find((item) => item.service === "direct")?.usage).toBe(12345);
+    for (const [index, service] of services.entries()) {
+      expect(usage.summary.find((item) => item.service === service)?.usage).toBe(10_000 + index);
+    }
+
+    const events = await bindings.DB.prepare(
+      "SELECT service, idempotency_key, metadata FROM usage_event WHERE user_id = ? AND unit = 'bytes' ORDER BY service",
+    )
+      .bind(user.user.id)
+      .all<{ service: string; idempotency_key: string; metadata: string }>();
+    expect(events.results).toHaveLength(services.length);
+    for (const event of events.results) {
+      expect(event.idempotency_key).toBe(`${user.user.id}:${event.service}:${transferId}`);
+      expect(JSON.parse(event.metadata)).toMatchObject({ source: "verified_winner_payload", transferId });
+    }
   });
 });

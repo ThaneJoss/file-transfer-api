@@ -11,7 +11,7 @@ import {
 } from "./admin";
 import { createAuth } from "./auth";
 import { createRegistrationContext, normalizeRegistrationName } from "./passkey-registration";
-import { createPickup, isPickupVariant, pickupCodePattern } from "./pickups";
+import { createPickup, isPickupRoute, isPickupVariant, pickupCodePattern } from "./pickups";
 import { issueR2Credentials } from "./services/r2";
 import { matchSfuRoute, proxySfuRequest } from "./services/sfu";
 import { issueTurnCredentials } from "./services/turn";
@@ -22,7 +22,10 @@ import { getUsageSummary, recordUsage } from "./usage";
 export { PickupSession } from "./durable/pickup-session";
 
 const app = new Hono<AppEnv>();
-const maxJsonBodyBytes = 64 * 1024;
+const defaultMaxJsonBodyBytes = 64 * 1024;
+const maxPickupSignalBytes = 384 * 1024;
+// Leave room for the JSON field name and escaping around a full-size signal.
+const maxPickupJsonBodyBytes = maxPickupSignalBytes + 1024;
 
 function allowedOrigins(env: Bindings) {
   return [
@@ -50,19 +53,23 @@ function optionalByteCount(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-async function readJsonObject(c: Context<AppEnv>) {
+function utf8ByteLength(value: string) {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+async function readJsonObject(c: Context<AppEnv>, maxBytes = defaultMaxJsonBodyBytes) {
   if (!c.req.header("content-type")?.toLowerCase().startsWith("application/json")) {
     return { error: c.json({ error: "Content-Type must be application/json" }, 415) };
   }
 
   const declaredLength = Number(c.req.header("content-length") ?? "0");
-  if (Number.isFinite(declaredLength) && declaredLength > maxJsonBodyBytes) {
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     return { error: c.json({ error: "Request body too large" }, 413) };
   }
 
   try {
     const body = await c.req.text();
-    if (new TextEncoder().encode(body).byteLength > maxJsonBodyBytes) {
+    if (new TextEncoder().encode(body).byteLength > maxBytes) {
       return { error: c.json({ error: "Request body too large" }, 413) };
     }
     const value = JSON.parse(body) as unknown;
@@ -206,8 +213,14 @@ app.post("/v1/usage/transfers", async (c) => {
   const service = parsed.value.service;
   const bytes = optionalByteCount(parsed.value.bytes);
   const transferId = typeof parsed.value.transferId === "string" ? parsed.value.transferId.trim() : "";
-  if (service !== "direct" && service !== "stun") {
-    return c.json({ error: "service must be direct or stun" }, 400);
+  if (
+    service !== "direct" &&
+    service !== "stun" &&
+    service !== "turn" &&
+    service !== "sfu" &&
+    service !== "r2"
+  ) {
+    return c.json({ error: "service must be direct, stun, turn, sfu or r2" }, 400);
   }
   if (bytes === null || bytes === undefined) {
     return c.json({ error: "bytes must be a non-negative safe integer" }, 400);
@@ -221,9 +234,139 @@ app.post("/v1/usage/transfers", async (c) => {
     service,
     quantity: bytes,
     idempotencyKey: `${userId}:${service}:${transferId}`,
-    metadata: { source: "completed_data_channel_transfer", transferId },
+    metadata: { source: "verified_winner_payload", transferId },
   });
   return recorded ? c.json({ recorded: true }, 201) : c.json({ recorded: false }, 200);
+});
+
+app.get("/v1/pickups/:code/status", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getStatus(userId);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "get_status" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this transfer" }, 403);
+  if (result.status === "found") {
+    return c.json({ cancelled: result.cancelled, expiresAt: result.expiresAt });
+  }
+  return c.json({ error: "Pickup code not found or expired" }, 404);
+});
+
+app.put("/v1/pickups/:code/cancel", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).cancel(userId);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "cancel" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this transfer" }, 403);
+  if (result.status === "won") return c.json({ error: "Pickup code already has a winning route" }, 409);
+  if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
+  return c.json({ cancelled: true });
+});
+
+app.get("/v1/pickups/:code/selection", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getSelection(userId);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "get_selection" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code is not bound to this receiver" }, 403);
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "found" && result.route !== null) return c.json({ route: result.route });
+  if (result.status === "found") return c.json({ error: "Pickup route not selected yet" }, 404);
+  return c.json({ error: "Pickup code not found or expired" }, 404);
+});
+
+app.put("/v1/pickups/:code/selection", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) return parsed.error;
+  if (Object.keys(parsed.value).length !== 1 || !isPickupRoute(parsed.value.route)) {
+    return c.json({ error: "Request body must contain only route (direct, stun, turn, sfu or r2)" }, 400);
+  }
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).submitSelection(userId, parsed.value.route);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "submit_selection" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "won") return c.json({ error: "Pickup code already has a winning route" }, 409);
+  if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
+  return c.json({ accepted: true });
+});
+
+app.get("/v1/pickups/:code/winner", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getWinner(userId);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "get_winner" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "found" && result.winner !== null) return c.json(result.winner);
+  if (result.status === "found") return c.json({ error: "Pickup winner not confirmed yet" }, 404);
+  return c.json({ error: "Pickup code not found or expired" }, 404);
+});
+
+app.put("/v1/pickups/:code/winner", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const parsed = await readJsonObject(c);
+  if ("error" in parsed) return parsed.error;
+  const keys = Object.keys(parsed.value);
+  if (
+    keys.length !== 3 ||
+    !keys.every((key) => key === "route" || key === "bytes" || key === "sha256") ||
+    !isPickupRoute(parsed.value.route) ||
+    optionalByteCount(parsed.value.bytes) === null ||
+    optionalByteCount(parsed.value.bytes) === undefined ||
+    typeof parsed.value.sha256 !== "string" ||
+    !/^[a-fA-F0-9]{64}$/.test(parsed.value.sha256)
+  ) {
+    return c.json({ error: "Request body must contain route, non-negative integer bytes and a 64-character SHA-256" }, 400);
+  }
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).submitWinner(userId, {
+    route: parsed.value.route,
+    bytes: parsed.value.bytes as number,
+    sha256: parsed.value.sha256.toLowerCase(),
+  });
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "submit_winner" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code is not bound to this receiver" }, 403);
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "won") return c.json({ error: "Pickup code already has a winning route" }, 409);
+  if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
+  return c.json({ accepted: true });
 });
 
 app.get("/v1/pickups/:code/answer", async (c) => {
@@ -238,6 +381,7 @@ app.get("/v1/pickups/:code/answer", async (c) => {
     metadata: { operation: "get_answer" },
   });
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "found") return c.json({ answer: result.answer });
   return c.json({ error: "Pickup code not found or expired" }, 404);
 });
@@ -245,13 +389,15 @@ app.get("/v1/pickups/:code/answer", async (c) => {
 app.put("/v1/pickups/:code/answer", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
-  const parsed = await readJsonObject(c);
+  const parsed = await readJsonObject(c, maxPickupJsonBodyBytes);
   if ("error" in parsed) return parsed.error;
   if (Object.keys(parsed.value).length !== 1 || typeof parsed.value.answer !== "string") {
     return c.json({ error: "Request body must contain only answer" }, 400);
   }
   const answer = parsed.value.answer.trim();
-  if (!answer || answer.length > 60_000) return c.json({ error: "answer must be 1 to 60000 characters" }, 400);
+  if (!answer || utf8ByteLength(answer) > maxPickupSignalBytes) {
+    return c.json({ error: "answer must be 1 to 393216 UTF-8 bytes" }, 400);
+  }
   const { userId } = c.get("auth");
   const result = await c.env.PICKUP_SESSIONS.getByName(code).submitAnswer(userId, answer);
   await recordUsage(c.env, {
@@ -260,6 +406,7 @@ app.put("/v1/pickups/:code/answer", async (c) => {
     quantity: 1,
     metadata: { operation: "submit_answer" },
   });
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "answered") return c.json({ error: "Pickup code already has an answer" }, 409);
   if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
   return c.json({ accepted: true });
@@ -276,19 +423,24 @@ app.get("/v1/pickups/:code", async (c) => {
     quantity: 1,
     metadata: { operation: "get_offer" },
   });
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status !== "found") return c.json({ error: "Pickup code not found or expired" }, 404);
   return c.json(result);
 });
 
 app.post("/v1/pickups", async (c) => {
-  const parsed = await readJsonObject(c);
+  const parsed = await readJsonObject(c, maxPickupJsonBodyBytes);
   if ("error" in parsed) return parsed.error;
   if (Object.keys(parsed.value).some((key) => key !== "variant" && key !== "offer")) {
     return c.json({ error: "Request body may only contain variant and offer" }, 400);
   }
   const offer = typeof parsed.value.offer === "string" ? parsed.value.offer.trim() : "";
-  if (!isPickupVariant(parsed.value.variant)) return c.json({ error: "variant must be direct, stun, turn, sfu or r2" }, 400);
-  if (!offer || offer.length > 60_000) return c.json({ error: "offer must be 1 to 60000 characters" }, 400);
+  if (!isPickupVariant(parsed.value.variant)) {
+    return c.json({ error: "variant must be direct, stun, turn, sfu, r2 or multipath" }, 400);
+  }
+  if (!offer || utf8ByteLength(offer) > maxPickupSignalBytes) {
+    return c.json({ error: "offer must be 1 to 393216 UTF-8 bytes" }, 400);
+  }
   const { userId } = c.get("auth");
   const pickup = await createPickup(c.env, {
     senderUserId: userId,
@@ -314,26 +466,12 @@ app.post("/v1/turn/credentials", async (c) => {
   if (ttlSeconds === null) {
     return c.json({ error: "ttlSeconds must be an integer from 60 to 86400" }, 400);
   }
-  const fileSizeBytes = optionalByteCount(parsed.value.fileSizeBytes);
-  if (fileSizeBytes === null) {
+  if (optionalByteCount(parsed.value.fileSizeBytes) === null) {
     return c.json({ error: "fileSizeBytes must be a non-negative safe integer" }, 400);
   }
 
   try {
-    const { userId } = c.get("auth");
     const credentials = await issueTurnCredentials(c.env, ttlSeconds);
-    if (fileSizeBytes !== undefined) {
-      await recordUsage(c.env, {
-        userId,
-        service: "turn",
-        quantity: fileSizeBytes,
-        action: "turn.relay.bytes",
-        metadata: {
-          ttlSeconds,
-          source: "declared_file_size",
-        },
-      });
-    }
     return c.json(credentials, 201);
   } catch (error) {
     logUpstreamError("turn", error);
@@ -355,8 +493,7 @@ app.post("/v1/r2/credentials", async (c) => {
   if (ttlSeconds === null) {
     return c.json({ error: "ttlSeconds must be an integer from 60 to 3600" }, 400);
   }
-  const fileSizeBytes = optionalByteCount(parsed.value.fileSizeBytes);
-  if (fileSizeBytes === null) {
+  if (optionalByteCount(parsed.value.fileSizeBytes) === null) {
     return c.json({ error: "fileSizeBytes must be a non-negative safe integer" }, 400);
   }
 
@@ -367,20 +504,6 @@ app.post("/v1/r2/credentials", async (c) => {
       fileName,
       ttlSeconds,
     });
-    if (fileSizeBytes !== undefined) {
-      await recordUsage(c.env, {
-        userId,
-        service: "r2",
-        quantity: fileSizeBytes,
-        action: "r2.upload.bytes",
-        metadata: {
-          fileName,
-          objectKey: credentials.objectKey,
-          ttlSeconds,
-          source: "declared_file_size",
-        },
-      });
-    }
     return c.json(credentials, 201);
   } catch (error) {
     logUpstreamError("r2", error);
@@ -399,12 +522,12 @@ app.all("/v1/sfu/*", async (c) => {
   }
 
   const declaredLength = Number(c.req.header("content-length") ?? "0");
-  if (Number.isFinite(declaredLength) && declaredLength > maxJsonBodyBytes) {
+  if (Number.isFinite(declaredLength) && declaredLength > defaultMaxJsonBodyBytes) {
     return c.json({ error: "Request body too large" }, 413);
   }
 
   const body = await c.req.text();
-  if (new TextEncoder().encode(body).byteLength > maxJsonBodyBytes) {
+  if (new TextEncoder().encode(body).byteLength > defaultMaxJsonBodyBytes) {
     return c.json({ error: "Request body too large" }, 413);
   }
 

@@ -51,9 +51,8 @@ Worker 只代理文件传输需要的控制面接口，长期 App Token 不离�
 文件数据不经过 Worker 或 Durable Object。`usage_event.quantity` 配合 `unit` 记录
 `bytes` 或 `requests`；
 `credential.issued`、`session.create` 等控制面次数不作为额度依据。TURN 与 R2
-凭证接口可接收 `fileSizeBytes`，在短期凭证签发成功后立即写入对应服务用量，
-不等待实际传输完成。SFU data channel 的精确 per-user bytes 需要 Cloudflare
-侧可归属的流量回传或后续专门埋点；在没有可信来源前，API 不用会话次数冒充流量。
+凭证接口为兼容旧客户端仍可接收 `fileSizeBytes`，但签发凭证不计文件流量。五种传输方式
+只在文件完成校验后，通过幂等的 `/v1/usage/transfers` 上报真实完成字节。
 
 ## 运行时密钥
 
@@ -214,14 +213,28 @@ curl https://api.file.thanejoss.com/health
 - `POST /v1/passkey/registration-context`，公开，仅签发短期一次性注册上下文
 - `GET /v1/me`，需要 Better Auth session
 - `GET /v1/usage`，返回当前用户 UTC 当月六类用量与额度
-- `POST /v1/usage/transfers`，幂等记录已完成的 Direct/STUN 发送字节
+- `POST /v1/usage/transfers`，幂等记录五种方式已完成并校验的传输字节
 - `POST /v1/pickups`，创建 8 位取件码
 - `GET /v1/pickups/{code}`，读取 Offer
 - `PUT /v1/pickups/{code}/answer`，写入 Answer
 - `GET /v1/pickups/{code}/answer`，发送方轮询 Answer
+- `PUT /v1/pickups/{code}/selection`，发送方发布或更新当前激活的多路传输路线
+- `GET /v1/pickups/{code}/selection`，已绑定接收方读取选定路线
+- `PUT /v1/pickups/{code}/winner`，已绑定接收方一次性确认完成校验的获胜路线
+- `GET /v1/pickups/{code}/winner`，发送方读取获胜路线和完整性结果
+- `PUT /v1/pickups/{code}/cancel`，发送方或已绑定接收方取消传输
+- `GET /v1/pickups/{code}/status`，发送方或已绑定接收方读取取消状态和过期时间
 - `POST /v1/turn/credentials`
 - `POST /v1/r2/credentials`
 - `POST|PUT /v1/sfu/*`，仅允许文件传输所需的 SFU 控制面操作
+
+多路协调接口在状态尚未产生时返回 `404`。写入 selection 或 winner 成功时返回
+`{"accepted":true}`。selection 在 winner 产生前可更新，同一路线重试幂等；完全相同的 winner
+重试也幂等成功，冲突 winner 或 winner 产生后再更新 selection 返回 `409`。selection 读取结果为 `{"route":"direct"}`；
+winner 读取结果为 `{"route":"direct","bytes":123,"sha256":"..."}`。Pickup 的 Offer 和
+Answer 最多各为 384 KiB（按 UTF-8 字节计）。
+取消接口可幂等重试。取消后，Offer、Answer、selection 和 winner 的读写都返回 `410`，接收端可通过
+status 接口及时停止正在进行的多路传输；winner 已确认后再取消返回 `409`。
 
 浏览器跨域调用必须携带 cookie：
 
@@ -230,7 +243,7 @@ await fetch("https://api.file.thanejoss.com/v1/turn/credentials", {
   method: "POST",
   credentials: "include",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ ttlSeconds: 3600, fileSizeBytes: file.size }),
+  body: JSON.stringify({ ttlSeconds: 3600 }),
 });
 ```
 
@@ -269,19 +282,19 @@ Access 策略保护；`/admin/api/*` 同样依赖该策略。
 TURN 请求体：
 
 ```json
-{"ttlSeconds":3600,"fileSizeBytes":123456}
+{"ttlSeconds":3600}
 ```
 
 R2 请求体：
 
 ```json
-{"fileName":"example.bin","ttlSeconds":900,"fileSizeBytes":123456}
+{"fileName":"example.bin","ttlSeconds":900}
 ```
 
 R2 响应包含 `accountId`、`bucket`、`endpoint`、服务端生成的 `objectKey`，
 以及 `accessKeyId`、`secretAccessKey`、`sessionToken`、`expiresAt`。前端的
 S3 签名实现必须同时发送 `sessionToken`。TURN 与 R2 的 `fileSizeBytes` 可省略；
-省略时后端无法确认本次文件大小，因此不会写入该服务 bytes 用量。
+该兼容字段不参与用量记录，实际完成字节统一由 `/v1/usage/transfers` 上报。
 
 SFU 代理路径与 Cloudflare Realtime 的应用内路径一致，例如：
 

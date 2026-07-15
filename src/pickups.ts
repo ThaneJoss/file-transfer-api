@@ -1,9 +1,14 @@
 import type { Bindings } from "./types";
-import type { PickupVariant } from "./durable/pickup-session";
+import type { PickupRoute, PickupVariant } from "./durable/pickup-session";
 
 export const pickupCodePattern = /^\d{8}$/;
 export const pickupLifetimeMs = 60 * 60 * 1000;
-export const pickupVariants = ["direct", "stun", "turn", "sfu", "r2"] as const satisfies readonly PickupVariant[];
+export const pickupRoutes = ["direct", "stun", "turn", "sfu", "r2"] as const satisfies readonly PickupRoute[];
+export const pickupVariants = [...pickupRoutes, "multipath"] as const satisfies readonly PickupVariant[];
+
+export function isPickupRoute(value: unknown): value is PickupRoute {
+  return typeof value === "string" && pickupRoutes.includes(value as PickupRoute);
+}
 
 export function isPickupVariant(value: unknown): value is PickupVariant {
   return typeof value === "string" && pickupVariants.includes(value as PickupVariant);
