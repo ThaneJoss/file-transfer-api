@@ -16,7 +16,7 @@ export function isPickupVariant(value: unknown): value is PickupVariant {
 
 export async function createPickup(
   env: Bindings,
-  input: { senderUserId: string; variant: PickupVariant; offer: string },
+  input: { senderUserId: string; variant: PickupVariant; offer?: string },
 ) {
   const expiresAt = Date.now() + pickupLifetimeMs;
   for (let attempt = 0; attempt < 32; attempt += 1) {

@@ -214,8 +214,9 @@ curl https://api.file.thanejoss.com/health
 - `GET /v1/me`，需要 Better Auth session
 - `GET /v1/usage`，返回当前用户 UTC 当月六类用量与额度
 - `POST /v1/usage/transfers`，幂等记录五种方式已完成并校验的传输字节
-- `POST /v1/pickups`，创建 8 位取件码
-- `GET /v1/pickups/{code}`，读取 Offer
+- `POST /v1/pickups`，创建 8 位取件码；可省略 `offer` 先进入准备状态
+- `PUT /v1/pickups/{code}/offer`，发送方为已预留取件码一次性发布 Offer
+- `GET /v1/pickups/{code}`，读取 Offer；尚未发布时返回 `202 pending`，可用 `?wait=20000` 长轮询
 - `PUT /v1/pickups/{code}/answer`，写入 Answer
 - `GET /v1/pickups/{code}/answer`，发送方轮询 Answer
 - `PUT /v1/pickups/{code}/selection`，发送方发布或更新当前激活的多路传输路线

@@ -407,6 +407,35 @@ app.put("/v1/pickups/:code/answer", async (c) => {
     metadata: { operation: "submit_answer" },
   });
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "pending") return c.json({ error: "Pickup offer is not ready yet" }, 409);
+  if (result.status === "answered") return c.json({ error: "Pickup code already has an answer" }, 409);
+  if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
+  return c.json({ accepted: true });
+});
+
+app.put("/v1/pickups/:code/offer", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const parsed = await readJsonObject(c, maxPickupJsonBodyBytes);
+  if ("error" in parsed) return parsed.error;
+  if (Object.keys(parsed.value).length !== 1 || typeof parsed.value.offer !== "string") {
+    return c.json({ error: "Request body must contain only offer" }, 400);
+  }
+  const offer = parsed.value.offer.trim();
+  if (!offer || utf8ByteLength(offer) > maxPickupSignalBytes) {
+    return c.json({ error: "offer must be 1 to 393216 UTF-8 bytes" }, 400);
+  }
+  const { userId } = c.get("auth");
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).publishOffer(userId, offer);
+  await recordUsage(c.env, {
+    userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation: "publish_offer" },
+  });
+  if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
+  if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "published") return c.json({ error: "Pickup offer was already published" }, 409);
   if (result.status === "answered") return c.json({ error: "Pickup code already has an answer" }, 409);
   if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
   return c.json({ accepted: true });
@@ -415,8 +444,13 @@ app.put("/v1/pickups/:code/answer", async (c) => {
 app.get("/v1/pickups/:code", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const waitValue = c.req.query("wait");
+  const waitMs = waitValue === undefined ? 0 : Number(waitValue);
+  if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 25_000) {
+    return c.json({ error: "wait must be an integer from 0 to 25000 milliseconds" }, 400);
+  }
   const { userId } = c.get("auth");
-  const result = await c.env.PICKUP_SESSIONS.getByName(code).getOffer();
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getOffer(waitMs);
   await recordUsage(c.env, {
     userId,
     service: "durable",
@@ -424,6 +458,7 @@ app.get("/v1/pickups/:code", async (c) => {
     metadata: { operation: "get_offer" },
   });
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (result.status === "pending") return c.json(result, 202);
   if (result.status !== "found") return c.json({ error: "Pickup code not found or expired" }, 404);
   return c.json(result);
 });
@@ -434,18 +469,21 @@ app.post("/v1/pickups", async (c) => {
   if (Object.keys(parsed.value).some((key) => key !== "variant" && key !== "offer")) {
     return c.json({ error: "Request body may only contain variant and offer" }, 400);
   }
-  const offer = typeof parsed.value.offer === "string" ? parsed.value.offer.trim() : "";
+  if (parsed.value.offer !== undefined && typeof parsed.value.offer !== "string") {
+    return c.json({ error: "offer must be a string when provided" }, 400);
+  }
+  const offer = typeof parsed.value.offer === "string" ? parsed.value.offer.trim() : undefined;
   if (!isPickupVariant(parsed.value.variant)) {
     return c.json({ error: "variant must be direct, stun, turn, sfu, r2 or multipath" }, 400);
   }
-  if (!offer || utf8ByteLength(offer) > maxPickupSignalBytes) {
+  if (offer !== undefined && (!offer || utf8ByteLength(offer) > maxPickupSignalBytes)) {
     return c.json({ error: "offer must be 1 to 393216 UTF-8 bytes" }, 400);
   }
   const { userId } = c.get("auth");
   const pickup = await createPickup(c.env, {
     senderUserId: userId,
     variant: parsed.value.variant,
-    offer,
+    ...(offer === undefined ? {} : { offer }),
   });
   await recordUsage(c.env, {
     userId,

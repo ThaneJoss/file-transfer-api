@@ -74,6 +74,87 @@ describe("pickup code API", () => {
     expect(receiverSummary.summary.find((item) => item.service === "durable")?.usage).toBe(2);
   });
 
+  it("reserves a code before the offer is ready and lets only the sender publish it once", async () => {
+    const sender = await registerUser("Deferred Offer Sender");
+    const receiver = await registerUser("Deferred Offer Receiver");
+    const outsider = await registerUser("Deferred Offer Outsider");
+    const createResponse = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath" }),
+      },
+      sender.jar,
+    );
+    expect(createResponse.status).toBe(201);
+    const pickup = await createResponse.json<{ code: string; expiresAt: number }>();
+
+    const pendingResponse = await request(`/v1/pickups/${pickup.code}`, {}, receiver.jar);
+    expect(pendingResponse.status).toBe(202);
+    expect(await pendingResponse.json()).toEqual({
+      status: "pending",
+      variant: "multipath",
+      expiresAt: pickup.expiresAt,
+    });
+
+    const earlyAnswer = await request(
+      `/v1/pickups/${pickup.code}/answer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer: "too-early" }),
+      },
+      receiver.jar,
+    );
+    expect(earlyAnswer.status).toBe(409);
+    expect(await earlyAnswer.json()).toEqual({ error: "Pickup offer is not ready yet" });
+
+    const outsiderPublish = await request(
+      `/v1/pickups/${pickup.code}/offer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ offer: "hijacked-offer" }),
+      },
+      outsider.jar,
+    );
+    expect(outsiderPublish.status).toBe(403);
+
+    const publish = (offer: string) => request(
+      `/v1/pickups/${pickup.code}/offer`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ offer }),
+      },
+      sender.jar,
+    );
+    const waitingOffer = request(`/v1/pickups/${pickup.code}?wait=5000`, {}, receiver.jar);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const publishResponse = await publish("deferred-offer");
+    expect(publishResponse.status).toBe(200);
+    expect(await publishResponse.json()).toEqual({ accepted: true });
+    const waitingOfferResponse = await waitingOffer;
+    expect(waitingOfferResponse.status).toBe(200);
+    expect(await waitingOfferResponse.json()).toMatchObject({ status: "found", offer: "deferred-offer" });
+
+    const idempotentPublish = await publish("deferred-offer");
+    expect(idempotentPublish.status).toBe(200);
+    const conflictingPublish = await publish("different-offer");
+    expect(conflictingPublish.status).toBe(409);
+    expect(await conflictingPublish.json()).toEqual({ error: "Pickup offer was already published" });
+
+    const readyResponse = await request(`/v1/pickups/${pickup.code}`, {}, receiver.jar);
+    expect(readyResponse.status).toBe(200);
+    expect(await readyResponse.json()).toMatchObject({
+      status: "found",
+      variant: "multipath",
+      offer: "deferred-offer",
+      answered: false,
+    });
+  });
+
   it("accepts every transfer method as a pickup variant", async () => {
     const sender = await registerUser("Pickup Variant Sender");
     const receiver = await registerUser("Pickup Variant Receiver");
