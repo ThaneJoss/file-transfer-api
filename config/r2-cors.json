@@ -3,7 +3,7 @@
     {
       "allowed": {
         "origins": ["https://file.thanejoss.com"],
-        "methods": ["GET", "PUT"],
+        "methods": ["GET", "PUT", "POST", "DELETE"],
         "headers": [
           "Authorization",
           "Content-Type",

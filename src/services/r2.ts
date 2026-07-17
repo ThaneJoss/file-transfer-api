@@ -15,12 +15,23 @@ function safePathSegment(value: string, fallback: string) {
   return sanitized || fallback;
 }
 
-function buildObjectKey(userId: string, fileName: string) {
+function objectPrefix(userId: string) {
   const userSegment = safePathSegment(userId, "user");
+  return `users/${userSegment}/`;
+}
+
+function buildObjectKey(userId: string, fileName: string) {
   const fileSegment = safePathSegment(fileName, "file");
   const date = new Date().toISOString().slice(0, 10);
 
-  return `users/${userSegment}/${date}/${crypto.randomUUID()}-${fileSegment}`;
+  return `${objectPrefix(userId)}${date}/${crypto.randomUUID()}-${fileSegment}`;
+}
+
+export function isOwnedR2ObjectKey(userId: string, objectKey: string) {
+  return objectKey.length <= 1024 &&
+    !objectKey.includes("\0") &&
+    objectKey.startsWith(objectPrefix(userId)) &&
+    !objectKey.split("/").some((segment) => segment === ".." || segment === ".");
 }
 
 function bytesToHex(bytes: Uint8Array) {
@@ -47,9 +58,11 @@ export async function issueR2Credentials(
     userId: string;
     fileName: string;
     ttlSeconds: number;
+    objectKey?: string;
   },
 ) {
-  const objectKey = buildObjectKey(input.userId, input.fileName);
+  const objectKey = input.objectKey ?? buildObjectKey(input.userId, input.fileName);
+  if (!isOwnedR2ObjectKey(input.userId, objectKey)) throw new Error("R2 resume object key is not owned by this user");
   const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
   const parentSecretAccessKey = await resolveParentSecretAccessKey(env.R2_PARENT_API_TOKEN);
   const sessionJwt = await new SignJWT({

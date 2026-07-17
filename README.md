@@ -40,9 +40,10 @@ PNPM_VERSION=11.6.0
 Worker 只负责：
 
 1. Better Auth Passkey 注册、登录和 session 校验。
-2. 托管 TURN、R2、SFU 长期密钥，向已登录用户提供短期或受限访问。
+2. 托管 TURN、R2、SFU 长期密钥，向已登录发送方或绑定单个取件码的访客接收方提供短期、受限访问。
 3. 使用 Durable Object 保存 Direct/STUN/TURN/SFU/R2 的短期取件码信令，不保存文件内容。
 4. 将流量字节和 Durable 请求次数写入 `usage_event`，并提供用户额度与管理统计。
+5. 接收不包含文件名、取件码、Offer/Answer 或密钥的传输诊断事件，并写入 Cloudflare 结构化日志。
 
 TURN 返回短期 `iceServers`。R2 返回仅限一个服务端生成对象 key 的临时 S3
 凭证。Cloudflare Realtime SFU 没有可下发给浏览器的短期 App Token，因此
@@ -77,8 +78,9 @@ Read & Write 权限。所有敏感值只放在 Cloudflare Worker Runtime Secrets
 
 ## R2 CORS
 
-浏览器会直接向 R2 发送 `PUT`，并从预签名 URL 执行 `GET`。bucket CORS 需要允许生产
-前端 origin、`GET`/`PUT`，以及上传请求实际发送的签名头：
+浏览器会直接向 R2 发送单次 `PUT`，或使用 `POST` / `PUT` 完成 multipart 上传，并从
+预签名 URL 执行 `GET`。bucket CORS 需要允许生产前端 origin、`GET` / `PUT` / `POST` /
+`DELETE`，以及上传请求实际发送的签名头：
 
 ```sh
 pnpm r2:cors:apply
@@ -90,7 +92,7 @@ pnpm r2:cors:list
 ```json
 {
   "AllowedOrigins": ["https://file.thanejoss.com"],
-  "AllowedMethods": ["GET", "PUT"],
+  "AllowedMethods": ["GET", "PUT", "POST", "DELETE"],
   "AllowedHeaders": [
     "Authorization",
     "Content-Type",
@@ -120,7 +122,9 @@ pnpm db:migrations:apply:remote
 ```
 
 `migrations/0005_billing_quotas.sql` 将用量扩展为带单位的通用计费事件，并新增
-`user_quota`。`PickupSession` Durable Object migration 随 `wrangler deploy` 自动应用。
+`user_quota`。`migrations/0006_guest_claim_rate_limit.sql` 新增访客取件兑换的按分钟限流表；
+发布访客接收前必须先应用。`PickupSession` Durable Object migration 随 `wrangler deploy`
+自动应用。
 
 本地开发：
 
@@ -215,18 +219,20 @@ curl https://api.file.thanejoss.com/health
 - `GET /v1/usage`，返回当前用户 UTC 当月六类用量与额度
 - `POST /v1/usage/transfers`，幂等记录五种方式已完成并校验的传输字节
 - `POST /v1/pickups`，创建 8 位取件码；可省略 `offer` 先进入准备状态
+- `POST /v1/pickups/{code}/guest`，公开且限流；签发只绑定该取件码、随取件码过期的访客 JWT
 - `PUT /v1/pickups/{code}/offer`，发送方为已预留取件码一次性发布 Offer
 - `GET /v1/pickups/{code}`，读取 Offer；尚未发布时返回 `202 pending`，可用 `?wait=20000` 长轮询
 - `PUT /v1/pickups/{code}/answer`，写入 Answer
-- `GET /v1/pickups/{code}/answer`，发送方轮询 Answer
+- `GET /v1/pickups/{code}/answer`，发送方读取 Answer，支持 `?wait=0..25000`
 - `PUT /v1/pickups/{code}/selection`，发送方发布或更新当前激活的多路传输路线
-- `GET /v1/pickups/{code}/selection`，已绑定接收方读取选定路线
+- `GET /v1/pickups/{code}/selection`，已绑定接收方读取选定路线，支持 `?wait=0..25000`
 - `PUT /v1/pickups/{code}/winner`，已绑定接收方一次性确认完成校验的获胜路线
-- `GET /v1/pickups/{code}/winner`，发送方读取获胜路线和完整性结果
+- `GET /v1/pickups/{code}/winner`，发送方读取获胜路线和完整性结果，支持 `?wait=0..25000`
 - `PUT /v1/pickups/{code}/cancel`，发送方或已绑定接收方取消传输
-- `GET /v1/pickups/{code}/status`，发送方或已绑定接收方读取取消状态和过期时间
+- `GET /v1/pickups/{code}/status`，发送方或已绑定接收方读取取消状态和过期时间，支持 `?wait=0..25000`
 - `POST /v1/turn/credentials`
 - `POST /v1/r2/credentials`
+- `POST /v1/diagnostics/transfers`，接收脱敏、定长的线路结果与能力诊断
 - `POST|PUT /v1/sfu/*`，仅允许文件传输所需的 SFU 控制面操作
 
 多路协调接口在状态尚未产生时返回 `404`。写入 selection 或 winner 成功时返回
@@ -236,6 +242,11 @@ winner 读取结果为 `{"route":"direct","bytes":123,"sha256":"..."}`。Pickup 
 Answer 最多各为 384 KiB（按 UTF-8 字节计）。
 取消接口可幂等重试。取消后，Offer、Answer、selection 和 winner 的读写都返回 `410`，接收端可通过
 status 接口及时停止正在进行的多路传输；winner 已确认后再取消返回 `409`。
+
+访客令牌通过 `X-Pickup-Guest-Token` 发送。它只允许读取同一取件码的 Offer、selection、
+status，写入 Answer、winner、cancel，以及调用接收端所需的 TURN、SFU 和诊断接口；不能
+创建取件码、读取发送方 Answer/winner、访问用量或申请 R2 上传凭据。兑换接口按客户端
+地址每分钟最多 12 次尝试，只保存由服务端 secret 加盐的地址哈希，并定期清理旧 bucket。
 
 浏览器跨域调用必须携带 cookie：
 
@@ -289,13 +300,31 @@ TURN 请求体：
 R2 请求体：
 
 ```json
-{"fileName":"example.bin","ttlSeconds":900}
+{"fileName":"example.bin","ttlSeconds":900,"fileSizeBytes":10485760}
 ```
+
+断点续传时，已登录发送方可以额外提交上一次响应中的 `objectKey`。Worker 只接受
+`users/{当前 userId}/` 前缀且没有路径穿越片段的 key，并重新签发仍只允许该单对象的短期
+凭据；其他用户的 key 返回 `403`。
 
 R2 响应包含 `accountId`、`bucket`、`endpoint`、服务端生成的 `objectKey`，
 以及 `accessKeyId`、`secretAccessKey`、`sessionToken`、`expiresAt`。前端的
 S3 签名实现必须同时发送 `sessionToken`。TURN 与 R2 的 `fileSizeBytes` 可省略；
 该兼容字段不参与用量记录，实际完成字节统一由 `/v1/usage/transfers` 上报。
+
+所有 API 响应统一设置 CSP、防嵌入、`nosniff`、HSTS、COOP、CORP、Permissions Policy
+和 Referrer Policy；`/v1/*` 与 `/api/auth/*` 额外使用 `Cache-Control: no-store`。
+
+## 代码验证
+
+```sh
+pnpm check
+pnpm test
+```
+
+测试覆盖访客权限边界与限流数据、对象 key 所有权、Offer/Answer/selection/winner/status
+长轮询唤醒、取消、幂等 winner 和五类已验证用量。Cloudflare Worker 测试池首次启动较重，
+在低内存主机上应串行执行并给初始化预留时间。
 
 SFU 代理路径与 Cloudflare Realtime 的应用内路径一致，例如：
 

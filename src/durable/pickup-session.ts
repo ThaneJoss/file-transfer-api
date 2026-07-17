@@ -62,7 +62,8 @@ type StatusResult =
   | { status: "missing" | "expired" | "forbidden" };
 
 export class PickupSession extends DurableObject<Bindings> {
-  private readonly offerWaiters = new Set<() => void>();
+  private readonly changeWaiters = new Set<() => void>();
+  private changeVersion = 0;
 
   constructor(ctx: DurableObjectState, env: Bindings) {
     super(ctx, env);
@@ -119,9 +120,10 @@ export class PickupSession extends DurableObject<Bindings> {
   }
 
   async getOffer(waitMs = 0): Promise<LookupResult> {
+    const observedVersion = this.changeVersion;
     let result = this.readOfferResult();
     if (result.status === "pending" && waitMs > 0) {
-      await this.waitForOfferChange(waitMs);
+      await this.waitForChange(waitMs, observedVersion);
       result = this.readOfferResult();
     }
     return result;
@@ -161,7 +163,7 @@ export class PickupSession extends DurableObject<Bindings> {
       offer,
     );
     if (result.rowsWritten === 1) {
-      this.notifyOfferWaiters();
+      this.notifyChangeWaiters();
       return { status: "ok" };
     }
     return { status: "published" };
@@ -179,10 +181,21 @@ export class PickupSession extends DurableObject<Bindings> {
       answer,
       receiverUserId,
     );
+    this.notifyChangeWaiters();
     return { status: "ok" };
   }
 
-  async getAnswer(senderUserId: string): Promise<AnswerResult> {
+  async getAnswer(senderUserId: string, waitMs = 0): Promise<AnswerResult> {
+    const observedVersion = this.changeVersion;
+    let result = this.readAnswer(senderUserId);
+    if (result.status === "found" && result.answer === null && waitMs > 0) {
+      await this.waitForChange(waitMs, observedVersion);
+      result = this.readAnswer(senderUserId);
+    }
+    return result;
+  }
+
+  private readAnswer(senderUserId: string): AnswerResult {
     const record = this.readActiveRecord();
     if (!record) return this.readRecord() ? { status: "expired" } : { status: "missing" };
     if (record.sender_user_id !== senderUserId) return { status: "forbidden" };
@@ -202,10 +215,24 @@ export class PickupSession extends DurableObject<Bindings> {
       "UPDATE pickup_session SET selection_route = ? WHERE singleton = 1 AND winner_route IS NULL",
       route,
     );
-    return result.rowsWritten === 1 ? { status: "ok" } : { status: "won" };
+    if (result.rowsWritten === 1) {
+      this.notifyChangeWaiters();
+      return { status: "ok" };
+    }
+    return { status: "won" };
   }
 
-  async getSelection(receiverUserId: string): Promise<SelectionResult> {
+  async getSelection(receiverUserId: string, waitMs = 0): Promise<SelectionResult> {
+    const observedVersion = this.changeVersion;
+    let result = this.readSelection(receiverUserId);
+    if (result.status === "found" && result.route === null && waitMs > 0) {
+      await this.waitForChange(waitMs, observedVersion);
+      result = this.readSelection(receiverUserId);
+    }
+    return result;
+  }
+
+  private readSelection(receiverUserId: string): SelectionResult {
     const record = this.readActiveRecord();
     if (!record) return this.readRecord() ? { status: "expired" } : { status: "missing" };
     if (record.receiver_user_id !== receiverUserId) return { status: "forbidden" };
@@ -234,10 +261,24 @@ export class PickupSession extends DurableObject<Bindings> {
       winner.bytes,
       winner.sha256,
     );
-    return result.rowsWritten === 1 ? { status: "ok" } : { status: "won" };
+    if (result.rowsWritten === 1) {
+      this.notifyChangeWaiters();
+      return { status: "ok" };
+    }
+    return { status: "won" };
   }
 
-  async getWinner(senderUserId: string): Promise<WinnerResult> {
+  async getWinner(senderUserId: string, waitMs = 0): Promise<WinnerResult> {
+    const observedVersion = this.changeVersion;
+    let result = this.readWinner(senderUserId);
+    if (result.status === "found" && result.winner === null && waitMs > 0) {
+      await this.waitForChange(waitMs, observedVersion);
+      result = this.readWinner(senderUserId);
+    }
+    return result;
+  }
+
+  private readWinner(senderUserId: string): WinnerResult {
     const record = this.readActiveRecord();
     if (!record) return this.readRecord() ? { status: "expired" } : { status: "missing" };
     if (record.sender_user_id !== senderUserId) return { status: "forbidden" };
@@ -265,12 +306,22 @@ export class PickupSession extends DurableObject<Bindings> {
         "UPDATE pickup_session SET cancelled_at = ? WHERE singleton = 1 AND cancelled_at IS NULL",
         Date.now(),
       );
-      this.notifyOfferWaiters();
+      this.notifyChangeWaiters();
     }
     return { status: "ok" };
   }
 
-  async getStatus(userId: string): Promise<StatusResult> {
+  async getStatus(userId: string, waitMs = 0): Promise<StatusResult> {
+    const observedVersion = this.changeVersion;
+    let result = this.readStatus(userId);
+    if (result.status === "found" && !result.cancelled && waitMs > 0) {
+      await this.waitForChange(waitMs, observedVersion);
+      result = this.readStatus(userId);
+    }
+    return result;
+  }
+
+  private readStatus(userId: string): StatusResult {
     const record = this.readActiveRecord();
     if (!record) return this.readRecord() ? { status: "expired" } : { status: "missing" };
     if (record.sender_user_id !== userId && record.receiver_user_id !== userId) {
@@ -285,7 +336,7 @@ export class PickupSession extends DurableObject<Bindings> {
 
   async alarm(): Promise<void> {
     this.ctx.storage.sql.exec("DELETE FROM pickup_session WHERE expires_at <= ?", Date.now());
-    this.notifyOfferWaiters();
+    this.notifyChangeWaiters();
   }
 
   private readRecord() {
@@ -304,20 +355,22 @@ export class PickupSession extends DurableObject<Bindings> {
     }
   }
 
-  private waitForOfferChange(waitMs: number) {
+  private waitForChange(waitMs: number, observedVersion: number) {
+    if (observedVersion !== this.changeVersion) return Promise.resolve();
     return new Promise<void>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
       const done = () => {
         globalThis.clearTimeout(timer);
-        this.offerWaiters.delete(done);
+        this.changeWaiters.delete(done);
         resolve();
       };
       timer = globalThis.setTimeout(done, waitMs);
-      this.offerWaiters.add(done);
+      this.changeWaiters.add(done);
     });
   }
 
-  private notifyOfferWaiters() {
-    for (const done of [...this.offerWaiters]) done();
+  private notifyChangeWaiters() {
+    this.changeVersion += 1;
+    for (const done of [...this.changeWaiters]) done();
   }
 }
