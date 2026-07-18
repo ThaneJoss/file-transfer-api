@@ -512,12 +512,21 @@ app.post("/v1/turn/credentials", async (c) => {
     return parsed.error;
   }
 
-  const ttlSeconds = integerInRange(parsed.value.ttlSeconds, 3600, 60, 86400);
+  let ttlSeconds = integerInRange(parsed.value.ttlSeconds, 3600, 60, 86400);
   if (ttlSeconds === null) {
     return c.json({ error: "ttlSeconds must be an integer from 60 to 86400" }, 400);
   }
   if (optionalByteCount(parsed.value.fileSizeBytes) === null) {
     return c.json({ error: "fileSizeBytes must be a non-negative safe integer" }, 400);
+  }
+
+  const auth = c.get("auth");
+  if (auth.kind === "guest") {
+    const remainingTtlSeconds = Math.floor((auth.expiresAt - Date.now()) / 1000);
+    if (remainingTtlSeconds < 60) {
+      return c.json({ error: "Pickup guest token expires too soon to issue TURN credentials" }, 403);
+    }
+    ttlSeconds = Math.min(ttlSeconds, remainingTtlSeconds);
   }
 
   try {

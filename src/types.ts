@@ -6,8 +6,13 @@ export type AppEnv = {
     auth: {
       userId: string;
       sessionId: string;
-      kind: "session" | "guest";
-      pickupCode?: string;
+      kind: "session";
+    } | {
+      userId: string;
+      sessionId: string;
+      kind: "guest";
+      pickupCode: string;
+      expiresAt: number;
     };
   };
 };

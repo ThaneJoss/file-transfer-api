@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { consumeGuestClaimRateLimit } from "../src/guest";
 import type { UsageSummaryResponse } from "../src/usage";
 import { bindings, registerUser, request } from "./support";
@@ -688,9 +688,32 @@ describe("pickup code API", () => {
     const pickup = await created.json<{ code: string }>();
     const claimResponse = await request(`/v1/pickups/${pickup.code}/guest`, { method: "POST" });
     expect(claimResponse.status).toBe(201);
-    const claim = await claimResponse.json<{ token: string; pickup: { offer: string } }>();
+    const claim = await claimResponse.json<{ token: string; expiresAt: number; pickup: { offer: string } }>();
     expect(claim.pickup.offer).toBe("guest-offer");
     const guestHeaders = { "X-Pickup-Guest-Token": claim.token };
+
+    let issuedTurnTtl = 0;
+    const turnFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      issuedTurnTtl = (JSON.parse(String(init?.body)) as { ttl: number }).ttl;
+      return new Response(JSON.stringify({ iceServers: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    try {
+      const turnCredentials = await request("/v1/turn/credentials", {
+        method: "POST",
+        headers: { ...guestHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ ttlSeconds: 86_400 }),
+      });
+      expect(turnCredentials.status).toBe(201);
+      expect(issuedTurnTtl).toBeGreaterThanOrEqual(60);
+      expect(issuedTurnTtl).toBeLessThanOrEqual(3_600);
+      const issuedTurnExpiry = Date.parse((await turnCredentials.json<{ expiresAt: string }>()).expiresAt);
+      expect(issuedTurnExpiry).toBeLessThanOrEqual(claim.expiresAt);
+    } finally {
+      turnFetch.mockRestore();
+    }
 
     const offer = await request(`/v1/pickups/${pickup.code}`, { headers: guestHeaders });
     expect(offer.status).toBe(200);

@@ -42,6 +42,7 @@ export const requireSessionOrPickupGuest: MiddlewareHandler<AppEnv> = async (c, 
     sessionId: guest.actorId,
     kind: "guest",
     pickupCode: guest.pickupCode,
+    expiresAt: guest.expiresAt,
   });
   await next();
 };
