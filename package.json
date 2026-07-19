@@ -6,7 +6,7 @@
   "packageManager": "pnpm@11.6.0",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "pnpm db:migrations:apply:remote && wrangler deploy",
     "r2:cors:apply": "wrangler r2 bucket cors set \"$R2_BUCKET\" --file config/r2-cors.json --force",
     "r2:cors:list": "wrangler r2 bucket cors list \"$R2_BUCKET\"",
     "check": "tsc --noEmit",

@@ -115,7 +115,8 @@ pnpm db:migrations:list:remote
 ```
 
 Passkey 使用的 migration 是 `migrations/0003_passkey_auth.sql`，其中包含 Better
-Auth 的 `passkey` 表和一次性注册上下文表。部署新代码前先执行：
+Auth 的 `passkey` 表和一次性注册上下文表。`pnpm run deploy` 会先应用所有待执行的远程
+D1 migration，再发布 Worker，避免代码先于数据库结构上线。也可以在部署前单独执行：
 
 ```sh
 pnpm db:migrations:apply:remote
