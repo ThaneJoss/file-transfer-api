@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { consumeGuestClaimRateLimit } from "../src/guest";
 import type { UsageSummaryResponse } from "../src/usage";
 import { bindings, registerUser, request } from "./support";
 
@@ -609,5 +610,175 @@ describe("pickup code API", () => {
       expect(event.idempotency_key).toBe(`${user.user.id}:${event.service}:${transferId}`);
       expect(JSON.parse(event.metadata)).toMatchObject({ source: "verified_winner_payload", transferId });
     }
+  });
+
+  it("wakes long-polling answer, selection, winner and cancellation reads on state changes", async () => {
+    const sender = await registerUser("Long Poll Sender");
+    const receiver = await registerUser("Long Poll Receiver");
+    const created = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "long-poll-offer" }),
+      },
+      sender.jar,
+    );
+    const pickup = await created.json<{ code: string }>();
+
+    const waitingAnswer = request(`/v1/pickups/${pickup.code}/answer?wait=5000`, {}, sender.jar);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await request(
+      `/v1/pickups/${pickup.code}/answer`,
+      { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answer: "ready" }) },
+      receiver.jar,
+    );
+    expect(await (await waitingAnswer).json()).toEqual({ answer: "ready" });
+
+    const waitingSelection = request(`/v1/pickups/${pickup.code}/selection?wait=5000`, {}, receiver.jar);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ route: "direct" }) },
+      sender.jar,
+    );
+    expect(await (await waitingSelection).json()).toEqual({ route: "direct" });
+
+    const waitingWinner = request(`/v1/pickups/${pickup.code}/winner?wait=5000`, {}, sender.jar);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const winner = { route: "direct", bytes: 5, sha256: "ab".repeat(32) };
+    await request(
+      `/v1/pickups/${pickup.code}/winner`,
+      { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(winner) },
+      receiver.jar,
+    );
+    expect(await (await waitingWinner).json()).toEqual(winner);
+
+    const another = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "cancel-offer" }),
+      },
+      sender.jar,
+    ).then((response) => response.json<{ code: string }>());
+    await request(
+      `/v1/pickups/${another.code}/answer`,
+      { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answer: "bound" }) },
+      receiver.jar,
+    );
+    const waitingStatus = request(`/v1/pickups/${another.code}/status?wait=5000`, {}, receiver.jar);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await request(`/v1/pickups/${another.code}/cancel`, { method: "PUT" }, sender.jar);
+    expect(await (await waitingStatus).json()).toMatchObject({ cancelled: true });
+  });
+
+  it("lets a rate-limited guest receiver finish one pickup without gaining sender privileges", async () => {
+    const sender = await registerUser("Guest Sender");
+    const created = await request(
+      "/v1/pickups",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant: "multipath", offer: "guest-offer" }),
+      },
+      sender.jar,
+    );
+    const pickup = await created.json<{ code: string }>();
+    const claimResponse = await request(`/v1/pickups/${pickup.code}/guest`, { method: "POST" });
+    expect(claimResponse.status).toBe(201);
+    const claim = await claimResponse.json<{ token: string; expiresAt: number; pickup: { offer: string } }>();
+    expect(claim.pickup.offer).toBe("guest-offer");
+    const guestHeaders = { "X-Pickup-Guest-Token": claim.token };
+
+    let issuedTurnTtl = 0;
+    const turnFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      issuedTurnTtl = (JSON.parse(String(init?.body)) as { ttl: number }).ttl;
+      return new Response(JSON.stringify({ iceServers: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    try {
+      const turnCredentials = await request("/v1/turn/credentials", {
+        method: "POST",
+        headers: { ...guestHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ ttlSeconds: 86_400 }),
+      });
+      expect(turnCredentials.status).toBe(201);
+      expect(issuedTurnTtl).toBeGreaterThanOrEqual(60);
+      expect(issuedTurnTtl).toBeLessThanOrEqual(3_600);
+      const issuedTurnExpiry = Date.parse((await turnCredentials.json<{ expiresAt: string }>()).expiresAt);
+      expect(issuedTurnExpiry).toBeLessThanOrEqual(claim.expiresAt);
+    } finally {
+      turnFetch.mockRestore();
+    }
+
+    const offer = await request(`/v1/pickups/${pickup.code}`, { headers: guestHeaders });
+    expect(offer.status).toBe(200);
+    const answer = await request(`/v1/pickups/${pickup.code}/answer`, {
+      method: "PUT",
+      headers: { ...guestHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ answer: "guest-answer" }),
+    });
+    expect(answer.status).toBe(200);
+
+    const forbiddenAnswerRead = await request(`/v1/pickups/${pickup.code}/answer`, { headers: guestHeaders });
+    expect(forbiddenAnswerRead.status).toBe(401);
+    const forbiddenCreate = await request("/v1/pickups", {
+      method: "POST",
+      headers: { ...guestHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ variant: "direct", offer: "forbidden" }),
+    });
+    expect(forbiddenCreate.status).toBe(401);
+    const differentPickup = await request("/v1/pickups/99999999", { headers: guestHeaders });
+    expect(differentPickup.status).toBe(401);
+
+    await request(
+      `/v1/pickups/${pickup.code}/selection`,
+      { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ route: "r2" }) },
+      sender.jar,
+    );
+    const selection = await request(`/v1/pickups/${pickup.code}/selection`, { headers: guestHeaders });
+    expect(await selection.json()).toEqual({ route: "r2" });
+    const winner = { route: "r2", bytes: 10, sha256: "cd".repeat(32) };
+    const completion = await request(`/v1/pickups/${pickup.code}/winner`, {
+      method: "PUT",
+      headers: { ...guestHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify(winner),
+    });
+    expect(completion.status).toBe(200);
+    expect(await (await request(`/v1/pickups/${pickup.code}/winner`, {}, sender.jar)).json()).toEqual(winner);
+
+    const diagnostics = await request("/v1/diagnostics/transfers", {
+      method: "POST",
+      headers: { ...guestHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: crypto.randomUUID(), side: "receiver", outcome: "complete", mode: "auto", winner: "r2",
+        durationMs: 250, errorCode: null,
+        capabilities: { rtc: true, fileSystem: false, worker: true },
+        routes: { direct: "failed", r2: "complete" },
+      }),
+    });
+    expect(diagnostics.status).toBe(202);
+
+    const missing = await request("/v1/pickups/99999999/guest", { method: "POST" });
+    expect(missing.status).toBe(404);
+  });
+
+  it("limits guest pickup claims without retaining raw client addresses", async () => {
+    const address = `198.51.100.${Math.floor(Math.random() * 200) + 1}`;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await expect(consumeGuestClaimRateLimit(bindings, address)).resolves.toMatchObject({ allowed: true });
+    }
+    await expect(consumeGuestClaimRateLimit(bindings, address)).resolves.toMatchObject({
+      allowed: false,
+      retryAfterSeconds: 60,
+    });
+    const rows = await bindings.DB.prepare(
+      "SELECT client_hash FROM guest_claim_rate_limit WHERE client_hash = ?",
+    ).bind(address).all();
+    expect(rows.results).toHaveLength(0);
   });
 });

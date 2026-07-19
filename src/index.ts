@@ -10,12 +10,13 @@ import {
   setAdminQuota,
 } from "./admin";
 import { createAuth } from "./auth";
+import { consumeGuestClaimRateLimit, issuePickupGuestToken } from "./guest";
 import { createRegistrationContext, normalizeRegistrationName } from "./passkey-registration";
 import { createPickup, isPickupRoute, isPickupVariant, pickupCodePattern } from "./pickups";
-import { issueR2Credentials } from "./services/r2";
+import { isOwnedR2ObjectKey, issueR2Credentials } from "./services/r2";
 import { matchSfuRoute, proxySfuRequest } from "./services/sfu";
 import { issueTurnCredentials } from "./services/turn";
-import { requireSession } from "./session";
+import { requireSessionOrPickupGuest } from "./session";
 import type { AppEnv, Bindings } from "./types";
 import { getUsageSummary, recordUsage } from "./usage";
 
@@ -26,6 +27,27 @@ const defaultMaxJsonBodyBytes = 64 * 1024;
 const maxPickupSignalBytes = 384 * 1024;
 // Leave room for the JSON field name and escaping around a full-size signal.
 const maxPickupJsonBodyBytes = maxPickupSignalBytes + 1024;
+
+app.use("*", async (c, next) => {
+  await next();
+  const adminPage = c.req.path === "/admin" || c.req.path.startsWith("/admin/");
+  c.header(
+    "Content-Security-Policy",
+    adminPage
+      ? "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self'; form-action 'self'"
+      : "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'",
+  );
+  c.header("Cross-Origin-Opener-Policy", "same-origin");
+  c.header("Cross-Origin-Resource-Policy", adminPage ? "same-origin" : "cross-origin");
+  c.header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()");
+  c.header("Referrer-Policy", "no-referrer");
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  if (c.req.path.startsWith("/v1/") || c.req.path.startsWith("/api/auth/")) {
+    c.header("Cache-Control", "no-store");
+  }
+});
 
 function allowedOrigins(env: Bindings) {
   return [
@@ -55,6 +77,23 @@ function optionalByteCount(value: unknown) {
 
 function utf8ByteLength(value: string) {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function waitMilliseconds(c: Context<AppEnv>) {
+  const value = c.req.query("wait");
+  const waitMs = value === undefined ? 0 : Number(value);
+  return Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 25_000 ? waitMs : null;
+}
+
+async function recordPickupUsage(c: Context<AppEnv>, operation: string) {
+  const auth = c.get("auth");
+  if (auth.kind === "guest") return;
+  await recordUsage(c.env, {
+    userId: auth.userId,
+    service: "durable",
+    quantity: 1,
+    metadata: { operation },
+  });
 }
 
 async function readJsonObject(c: Context<AppEnv>, maxBytes = defaultMaxJsonBodyBytes) {
@@ -102,7 +141,7 @@ app.use(
 
       return allowedOrigins(c.env).includes(origin) ? origin : undefined;
     },
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "Authorization", "X-Pickup-Guest-Token"],
     allowMethods: ["GET", "POST", "PUT", "OPTIONS"],
     exposeHeaders: ["Content-Length"],
     credentials: true,
@@ -187,7 +226,29 @@ app.post("/v1/passkey/registration-context", async (c) => {
   return c.json({ context }, 201);
 });
 
-app.use("/v1/*", requireSession);
+app.post("/v1/pickups/:code/guest", async (c) => {
+  const code = c.req.param("code");
+  if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+
+  const rateLimit = await consumeGuestClaimRateLimit(
+    c.env,
+    c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? "unknown",
+  );
+  if (!rateLimit.allowed) {
+    c.header("Retry-After", String(rateLimit.retryAfterSeconds));
+    return c.json({ error: "Too many guest pickup attempts" }, 429);
+  }
+
+  const pickup = await c.env.PICKUP_SESSIONS.getByName(code).getOffer(0);
+  if (pickup.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
+  if (pickup.status !== "found" && pickup.status !== "pending") {
+    return c.json({ error: "Pickup code not found or expired" }, 404);
+  }
+  const guest = await issuePickupGuestToken(c.env.BETTER_AUTH_SECRET, code, pickup.expiresAt);
+  return c.json({ token: guest.token, expiresAt: guest.expiresAt, pickup }, 201);
+});
+
+app.use("/v1/*", requireSessionOrPickupGuest);
 
 app.get("/v1/me", async (c) => {
   const session = await createAuth(c.env).api.getSession({
@@ -242,14 +303,11 @@ app.post("/v1/usage/transfers", async (c) => {
 app.get("/v1/pickups/:code/status", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const waitMs = waitMilliseconds(c);
+  if (waitMs === null) return c.json({ error: "wait must be an integer from 0 to 25000 milliseconds" }, 400);
   const { userId } = c.get("auth");
-  const result = await c.env.PICKUP_SESSIONS.getByName(code).getStatus(userId);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "get_status" },
-  });
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getStatus(userId, waitMs);
+  await recordPickupUsage(c, "get_status");
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this transfer" }, 403);
   if (result.status === "found") {
     return c.json({ cancelled: result.cancelled, expiresAt: result.expiresAt });
@@ -262,12 +320,7 @@ app.put("/v1/pickups/:code/cancel", async (c) => {
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
   const { userId } = c.get("auth");
   const result = await c.env.PICKUP_SESSIONS.getByName(code).cancel(userId);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "cancel" },
-  });
+  await recordPickupUsage(c, "cancel");
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this transfer" }, 403);
   if (result.status === "won") return c.json({ error: "Pickup code already has a winning route" }, 409);
   if (result.status !== "ok") return c.json({ error: "Pickup code not found or expired" }, 404);
@@ -277,14 +330,11 @@ app.put("/v1/pickups/:code/cancel", async (c) => {
 app.get("/v1/pickups/:code/selection", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const waitMs = waitMilliseconds(c);
+  if (waitMs === null) return c.json({ error: "wait must be an integer from 0 to 25000 milliseconds" }, 400);
   const { userId } = c.get("auth");
-  const result = await c.env.PICKUP_SESSIONS.getByName(code).getSelection(userId);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "get_selection" },
-  });
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getSelection(userId, waitMs);
+  await recordPickupUsage(c, "get_selection");
   if (result.status === "forbidden") return c.json({ error: "Pickup code is not bound to this receiver" }, 403);
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "found" && result.route !== null) return c.json({ route: result.route });
@@ -302,12 +352,7 @@ app.put("/v1/pickups/:code/selection", async (c) => {
   }
   const { userId } = c.get("auth");
   const result = await c.env.PICKUP_SESSIONS.getByName(code).submitSelection(userId, parsed.value.route);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "submit_selection" },
-  });
+  await recordPickupUsage(c, "submit_selection");
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "won") return c.json({ error: "Pickup code already has a winning route" }, 409);
@@ -318,14 +363,11 @@ app.put("/v1/pickups/:code/selection", async (c) => {
 app.get("/v1/pickups/:code/winner", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const waitMs = waitMilliseconds(c);
+  if (waitMs === null) return c.json({ error: "wait must be an integer from 0 to 25000 milliseconds" }, 400);
   const { userId } = c.get("auth");
-  const result = await c.env.PICKUP_SESSIONS.getByName(code).getWinner(userId);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "get_winner" },
-  });
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getWinner(userId, waitMs);
+  await recordPickupUsage(c, "get_winner");
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "found" && result.winner !== null) return c.json(result.winner);
@@ -356,12 +398,7 @@ app.put("/v1/pickups/:code/winner", async (c) => {
     bytes: parsed.value.bytes as number,
     sha256: parsed.value.sha256.toLowerCase(),
   });
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "submit_winner" },
-  });
+  await recordPickupUsage(c, "submit_winner");
   if (result.status === "forbidden") return c.json({ error: "Pickup code is not bound to this receiver" }, 403);
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "won") return c.json({ error: "Pickup code already has a winning route" }, 409);
@@ -372,14 +409,11 @@ app.put("/v1/pickups/:code/winner", async (c) => {
 app.get("/v1/pickups/:code/answer", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
+  const waitMs = waitMilliseconds(c);
+  if (waitMs === null) return c.json({ error: "wait must be an integer from 0 to 25000 milliseconds" }, 400);
   const { userId } = c.get("auth");
-  const result = await c.env.PICKUP_SESSIONS.getByName(code).getAnswer(userId);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "get_answer" },
-  });
+  const result = await c.env.PICKUP_SESSIONS.getByName(code).getAnswer(userId, waitMs);
+  await recordPickupUsage(c, "get_answer");
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "found") return c.json({ answer: result.answer });
@@ -400,12 +434,7 @@ app.put("/v1/pickups/:code/answer", async (c) => {
   }
   const { userId } = c.get("auth");
   const result = await c.env.PICKUP_SESSIONS.getByName(code).submitAnswer(userId, answer);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "submit_answer" },
-  });
+  await recordPickupUsage(c, "submit_answer");
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "pending") return c.json({ error: "Pickup offer is not ready yet" }, 409);
   if (result.status === "answered") return c.json({ error: "Pickup code already has an answer" }, 409);
@@ -427,12 +456,7 @@ app.put("/v1/pickups/:code/offer", async (c) => {
   }
   const { userId } = c.get("auth");
   const result = await c.env.PICKUP_SESSIONS.getByName(code).publishOffer(userId, offer);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "publish_offer" },
-  });
+  await recordPickupUsage(c, "publish_offer");
   if (result.status === "forbidden") return c.json({ error: "Pickup code does not belong to this user" }, 403);
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "published") return c.json({ error: "Pickup offer was already published" }, 409);
@@ -444,19 +468,12 @@ app.put("/v1/pickups/:code/offer", async (c) => {
 app.get("/v1/pickups/:code", async (c) => {
   const code = c.req.param("code");
   if (!pickupCodePattern.test(code)) return c.json({ error: "Pickup code must contain exactly 8 digits" }, 400);
-  const waitValue = c.req.query("wait");
-  const waitMs = waitValue === undefined ? 0 : Number(waitValue);
-  if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 25_000) {
+  const waitMs = waitMilliseconds(c);
+  if (waitMs === null) {
     return c.json({ error: "wait must be an integer from 0 to 25000 milliseconds" }, 400);
   }
-  const { userId } = c.get("auth");
   const result = await c.env.PICKUP_SESSIONS.getByName(code).getOffer(waitMs);
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "get_offer" },
-  });
+  await recordPickupUsage(c, "get_offer");
   if (result.status === "cancelled") return c.json({ error: "Pickup transfer was cancelled" }, 410);
   if (result.status === "pending") return c.json(result, 202);
   if (result.status !== "found") return c.json({ error: "Pickup code not found or expired" }, 404);
@@ -485,12 +502,7 @@ app.post("/v1/pickups", async (c) => {
     variant: parsed.value.variant,
     ...(offer === undefined ? {} : { offer }),
   });
-  await recordUsage(c.env, {
-    userId,
-    service: "durable",
-    quantity: 1,
-    metadata: { operation: "create_pickup" },
-  });
+  await recordPickupUsage(c, "create_pickup");
   return c.json(pickup, 201);
 });
 
@@ -500,12 +512,21 @@ app.post("/v1/turn/credentials", async (c) => {
     return parsed.error;
   }
 
-  const ttlSeconds = integerInRange(parsed.value.ttlSeconds, 3600, 60, 86400);
+  let ttlSeconds = integerInRange(parsed.value.ttlSeconds, 3600, 60, 86400);
   if (ttlSeconds === null) {
     return c.json({ error: "ttlSeconds must be an integer from 60 to 86400" }, 400);
   }
   if (optionalByteCount(parsed.value.fileSizeBytes) === null) {
     return c.json({ error: "fileSizeBytes must be a non-negative safe integer" }, 400);
+  }
+
+  const auth = c.get("auth");
+  if (auth.kind === "guest") {
+    const remainingTtlSeconds = Math.floor((auth.expiresAt - Date.now()) / 1000);
+    if (remainingTtlSeconds < 60) {
+      return c.json({ error: "Pickup guest token expires too soon to issue TURN credentials" }, 403);
+    }
+    ttlSeconds = Math.min(ttlSeconds, remainingTtlSeconds);
   }
 
   try {
@@ -525,6 +546,7 @@ app.post("/v1/r2/credentials", async (c) => {
 
   const fileName = typeof parsed.value.fileName === "string" ? parsed.value.fileName.trim() : "";
   const ttlSeconds = integerInRange(parsed.value.ttlSeconds, 900, 60, 3600);
+  const requestedObjectKey = typeof parsed.value.objectKey === "string" ? parsed.value.objectKey.trim() : undefined;
   if (!fileName || fileName.length > 255) {
     return c.json({ error: "fileName must be a non-empty string up to 255 characters" }, 400);
   }
@@ -537,16 +559,59 @@ app.post("/v1/r2/credentials", async (c) => {
 
   try {
     const { userId } = c.get("auth");
+    if (requestedObjectKey !== undefined && !isOwnedR2ObjectKey(userId, requestedObjectKey)) {
+      return c.json({ error: "objectKey does not belong to this user" }, 403);
+    }
     const credentials = await issueR2Credentials(c.env, {
       userId,
       fileName,
       ttlSeconds,
+      ...(requestedObjectKey === undefined ? {} : { objectKey: requestedObjectKey }),
     });
     return c.json(credentials, 201);
   } catch (error) {
     logUpstreamError("r2", error);
     return c.json({ error: "R2 credential service unavailable" }, 502);
   }
+});
+
+app.post("/v1/diagnostics/transfers", async (c) => {
+  const parsed = await readJsonObject(c, 12 * 1024);
+  if ("error" in parsed) return parsed.error;
+  const value = parsed.value;
+  const allowedKeys = new Set([
+    "id", "side", "outcome", "mode", "winner", "durationMs", "errorCode", "capabilities", "routes",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    return c.json({ error: "Diagnostic payload contains unsupported fields" }, 400);
+  }
+  if (
+    typeof value.id !== "string" || !/^[0-9a-f-]{36}$/i.test(value.id) ||
+    (value.side !== "sender" && value.side !== "receiver") ||
+    (value.outcome !== "complete" && value.outcome !== "error" && value.outcome !== "cancelled") ||
+    (value.mode !== null && value.mode !== "auto" && value.mode !== "turbo" && value.mode !== "legacy") ||
+    (value.winner !== null && !isPickupRoute(value.winner)) ||
+    typeof value.durationMs !== "number" || !Number.isFinite(value.durationMs) || value.durationMs < 0 || value.durationMs > 86_400_000 ||
+    (value.errorCode !== null && (typeof value.errorCode !== "string" || !/^[A-Z0-9_]{2,64}$/.test(value.errorCode))) ||
+    !isDiagnosticCapabilities(value.capabilities) ||
+    !isDiagnosticRoutes(value.routes)
+  ) return c.json({ error: "Diagnostic payload is invalid" }, 400);
+
+  const auth = c.get("auth");
+  console.log(JSON.stringify({
+    event: "transfer_diagnostic",
+    actorKind: auth.kind,
+    id: value.id,
+    side: value.side,
+    outcome: value.outcome,
+    mode: value.mode,
+    winner: value.winner,
+    durationMs: Math.round(value.durationMs),
+    errorCode: value.errorCode,
+    capabilities: value.capabilities,
+    routes: value.routes,
+  }));
+  return c.json({ accepted: true }, 202);
 });
 
 app.all("/v1/sfu/*", async (c) => {
@@ -584,5 +649,20 @@ app.all("/v1/sfu/*", async (c) => {
 });
 
 app.notFound((c) => c.json({ error: "Not found" }, 404));
+
+function isDiagnosticCapabilities(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).every((key) => ["rtc", "fileSystem", "worker"].includes(key)) &&
+    ["rtc", "fileSystem", "worker"].every((key) => typeof record[key] === "boolean");
+}
+
+function isDiagnosticRoutes(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const allowedStates = new Set(["preparing", "ready", "probing", "selected", "transferring", "complete", "failed"]);
+  return Object.entries(value as Record<string, unknown>).every(([route, state]) =>
+    isPickupRoute(route) && typeof state === "string" && allowedStates.has(state),
+  );
+}
 
 export default app;

@@ -303,4 +303,46 @@ describe("usage API", () => {
     expect(summary.get("r2")?.bytes).toBe(0);
     expect(body.totalBytes).toBe(0);
   });
+
+  it("reissues temporary credentials for an owned multipart resume key only", async () => {
+    const owner = await registerUser("R2 Resume Owner");
+    const outsider = await registerUser("R2 Resume Outsider");
+    const first = await request(
+      "/v1/r2/credentials",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileName: "resume.bin", ttlSeconds: 900, fileSizeBytes: 8_000_000 }),
+      },
+      owner.jar,
+    ).then((response) => response.json<{ objectKey: string }>());
+
+    const resumed = await request(
+      "/v1/r2/credentials",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: "resume.bin",
+          ttlSeconds: 900,
+          fileSizeBytes: 8_000_000,
+          objectKey: first.objectKey,
+        }),
+      },
+      owner.jar,
+    );
+    expect(resumed.status).toBe(201);
+    expect(await resumed.json<{ objectKey: string }>()).toMatchObject({ objectKey: first.objectKey });
+
+    const stolen = await request(
+      "/v1/r2/credentials",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileName: "resume.bin", objectKey: first.objectKey }),
+      },
+      outsider.jar,
+    );
+    expect(stolen.status).toBe(403);
+  });
 });
