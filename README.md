@@ -1,3 +1,25 @@
+# file-transfer-api（已弃用）
+
+此 GitHub 仓库停止维护和部署，源码、测试、D1 migrations 与配置已迁入
+[ThaneJoss/file-transfer](https://github.com/ThaneJoss/file-transfer) 的 `worker/`。
+后续问题、修改与发布均在主仓库处理。
+
+主仓库 `main` 的 `0866551` 已通过
+[Cloudflare Worker 构建检查](https://github.com/ThaneJoss/file-transfer/runs/103968859037)。
+原 Cloudflare Worker `file-transfer-api` 和 `https://api.file.thanejoss.com` 继续运行；
+弃用此仓库不意味着停用 API、删除数据库或更换密钥。
+
+本仓库的 `pnpm deploy` 已禁用，以防旧构建连接覆盖主仓库版本。不要从本仓库直接运行
+Wrangler 发布、数据库迁移或 R2 写入命令，也不要重新连接自动部署。
+
+当前开发和部署说明见
+[主仓库 Worker 文档](https://github.com/ThaneJoss/file-transfer/blob/main/worker/README.md)。
+本仓库保留历史用于追溯；GitHub 归档状态以仓库页面为准。
+
+---
+
+## 历史文档（仅供追溯，以下部署与写入命令不再使用）
+
 # file-transfer-api
 
 File Transfer 的 Cloudflare Worker API。
